@@ -1,0 +1,29 @@
+# Render Blueprint — AI Phone Ordering System
+# Deploy: connect this repo to Render, it auto-detects this file
+
+services:
+  - type: web
+    name: chiang-mai-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: daphne config.asgi:application -p $PORT -b 0.0.0.0
+    preDeployCommand: python manage.py migrate
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "false"
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: RESTAURANT_PHONE
+        sync: false
+      - key: RESTAURANT_NAME
+        sync: false

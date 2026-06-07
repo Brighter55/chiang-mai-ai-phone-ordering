@@ -7,3 +7,4 @@ deepgram-sdk>=3.0
 twilio>=9.0
 python-decouple>=3.8
 python-dotenv>=1.0
+psycopg2-binary>=2.9
