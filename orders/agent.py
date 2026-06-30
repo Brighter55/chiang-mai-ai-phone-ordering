@@ -1,11 +1,11 @@
 """
-Conversation agent using Claude Haiku 4.5 for restaurant order taking.
+Conversation agent using OpenAI for restaurant order taking.
 """
 
 import json
 import logging
 from django.conf import settings
-from anthropic import Anthropic
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -83,62 +83,63 @@ def build_system_prompt():
 
 
 def get_client():
-    """Get Anthropic client."""
-    return Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    """Get OpenAI async client."""
+    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 class OrderAgent:
     """
     Manages a single phone conversation. Tracks conversation state,
-    sends transcripts to Claude Haiku, and detects finalized orders.
+    sends transcripts to OpenAI, and detects finalized orders.
     """
 
     def __init__(self):
         self.client = get_client()
         self.system_prompt = build_system_prompt()
         self.messages = []  # Conversation history (alternating user/assistant)
-        self.order = None  # Will hold the extracted order dict when finalized
+        self.order = None   # Will hold the extracted order dict when finalized
 
     async def process_transcript(self, text: str) -> str:
         """
-        Send the customer's spoken text to Claude and get a response.
+        Send the customer's spoken text to OpenAI and get a response.
 
         Returns the assistant's response text.
         If the response contains an order_complete action, self.order is set.
         """
         self.messages.append({'role': 'user', 'content': text})
 
+        # Build messages: system prompt + conversation history
+        api_messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages
+
         try:
-            response = self.client.messages.create(
-                model='claude-haiku-4-5-20251001',
+            response = await self.client.chat.completions.create(
+                model='gpt-4o-mini',
                 max_tokens=300,
-                system=self.system_prompt,
-                messages=self.messages,
+                messages=api_messages,
             )
         except Exception as e:
-            logger.error(f'Claude API error: {e}')
+            logger.error(f'OpenAI API error: {e}')
             return "I'm sorry, I didn't quite catch that. Could you repeat it?"
 
-        reply = response.content[0].text.strip()
+        reply = response.choices[0].message.content.strip()
         self.messages.append({'role': 'assistant', 'content': reply})
 
-        # Check if Claude signaled order completion
+        # Check if the model signaled order completion
         self._try_extract_order(reply)
 
         return reply
 
     def _try_extract_order(self, text: str):
-        """Look for the order_complete JSON in Claude's response."""
+        """Look for the order_complete JSON in the response."""
         try:
             # Find JSON block in the response
             start = text.find('{"action":"order_complete"')
             if start == -1:
                 return
 
-            # Extract just the JSON part
-            end = text.find('}', start)
             # Find matching closing brace
             brace_count = 0
+            end = start
             for i in range(start, len(text)):
                 if text[i] == '{':
                     brace_count += 1

@@ -13,7 +13,7 @@ services:
         generateValue: true
       - key: DEBUG
         value: "false"
-      - key: ANTHROPIC_API_KEY
+      - key: OPENAI_API_KEY
         sync: false
       - key: DEEPGRAM_API_KEY
         sync: false
