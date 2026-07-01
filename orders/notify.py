@@ -33,11 +33,9 @@ def send_order_sms(order):
         for item in order.items.all()
     )
 
-    order_type = 'Pickup' if order.order_type == 'pickup' else 'Delivery'
-
     message = (
         f'🛎️ New Order #{order.id} | {order.customer_name}\n'
-        f'{order_type}\n'
+        f'Pickup\n'
         f'{items_text}\n'
         f'──────────\n'
         f'Total: ${order.total:.2f}\n'

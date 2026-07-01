@@ -4,10 +4,29 @@ Conversation agent using OpenAI for restaurant order taking.
 
 import json
 import logging
+import re
 from django.conf import settings
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+
+def strip_markdown(text: str) -> str:
+    """Remove common markdown artifacts that would be spoken by TTS."""
+    # Remove bold/italic markers
+    text = re.sub(r'\*{1,3}', '', text)
+    # Remove markdown link syntax [text](url)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Remove backticks (inline and code blocks)
+    text = re.sub(r'`{1,3}', '', text)
+    # Remove heading markers
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    # Collapse multiple spaces into one
+    text = re.sub(r' +', ' ', text)
+    # Collapse multiple newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 
 # System prompt template — menu is injected at call time
 SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You take food orders over the phone.
@@ -18,33 +37,43 @@ SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You ta
 - Confirm each item before moving on
 - Suggest popular items or upsells naturally when appropriate
 - Always repeat the full order before finalizing
+- Speak naturally — NEVER use markdown, bold, asterisks, bullet points, or any special characters in your responses
 
 ## The Menu
 {menu_text}
 
+## Understanding Protein Options & Pricing
+Each entree has a base price that INCLUDES your choice of protein. These are the protein choices listed as "Choice:" — they come at no extra charge.
+Items listed as "Add-on:" cost extra and are for customers who want ADDITIONAL protein or vegetables beyond what normally comes with the dish.
+
+Examples of correct pricing:
+- Pad Thai ($17.59) with chicken = $17.59 (chicken is the base protein, no extra charge)
+- Pad Thai ($17.59) with extra chicken = $20.68 (base $17.59 + add chicken $3.09)
+- Pad Thai ($17.59) with tofu = $17.59 (tofu is the base protein choice, no extra charge)
+- Do NOT tell customers that choosing chicken adds $3 — it only adds $3 if they ask for EXTRA chicken
+
 ## Order Flow
 1. Greet the customer: "Thank you for calling {restaurant_name}, this is AI order assistant. What can I get for you today?"
-2. Ask if this is for pickup or delivery
-3. Take their order item by item — ask about modifications where relevant
-4. After each item, confirm what you heard
-5. Suggest add-ons or popular items naturally (one suggestion max)
-6. When they're done, read back the full order with prices
-7. Ask for their name and a callback phone number
-8. Give them a total and estimated time
-9. Thank them and say goodbye
+2. Take their order item by item — ask about protein choice where relevant
+3. After each item, confirm what you heard
+4. Suggest add-ons or popular items naturally (one suggestion max)
+5. When they're done, read back the full order with prices
+6. Ask for their name and a callback phone number
+7. Give them a total and estimated time
+8. Thank them and say goodbye
 
 ## Rules
 - ONLY sell items on the menu — if someone asks for something not listed, politely say you don't have it and suggest the closest alternative
 - If you're unsure about something, ask the customer to repeat or clarify
 - Keep responses concise — under 2 sentences when possible
 - Do NOT make up prices or items
+- DO NOT use any markdown, asterisks, bold, or formatting symbols in your responses — speak in plain, natural language only
 - If the customer wants to cancel or start over, do it cheerfully
-- For pickup orders: tell them the order will be ready in about 20-25 minutes
-- For delivery orders: tell them delivery typically takes 30-45 minutes
+- Tell them the order will be ready in about 20 to 25 minutes
 
 ## Finalization
 When the order is complete and confirmed by the customer, output this exact JSON on its own line:
-{{"action":"order_complete","order":{{"customer_name":"...","customer_phone":"...","order_type":"pickup or delivery","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"modifications"}}],"notes":"any special instructions","total":99.99}}}}
+{{"action":"order_complete","order":{{"customer_name":"...","customer_phone":"...","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"modifications"}}],"notes":"any special instructions","total":99.99}}}}
 
 ## Current Conversation
 Keep track of what's been ordered so far. The customer may add items, remove items, or modify items at any point."""
@@ -63,14 +92,29 @@ def get_menu_text():
         cat = item.category or 'Other'
         if cat not in categories:
             categories[cat] = []
-        modifier_str = ''
+        lines = [f'  - {item.name} (${item.price:.2f})']
+
         if item.modifiers:
-            modifier_str = ' [' + ', '.join(item.modifiers) + ']'
-        categories[cat].append(f'  - {item.name} (${item.price:.2f}){modifier_str}')
+            # Separate free choices (no +$) from paid add-ons (have +$)
+            choices = []
+            addons = []
+            for m in item.modifiers:
+                if '(+' in m:
+                    # Extract price and clean up name
+                    addons.append(m)
+                else:
+                    choices.append(m)
+
+            if choices:
+                lines.append(f'    Choice of: {", ".join(choices)}')
+            if addons:
+                lines.append(f'    Add-ons (extra charge): {", ".join(addons)}')
+
+        categories[cat].append('\n'.join(lines))
 
     sections = []
     for cat, item_list in categories.items():
-        sections.append(f'### {cat}\n' + '\n'.join(item_list))
+        sections.append(f'{cat}\n' + '\n'.join(item_list))
 
     return '\n\n'.join(sections)
 
@@ -122,6 +166,7 @@ class OrderAgent:
             return "I'm sorry, I didn't quite catch that. Could you repeat it?"
 
         reply = response.choices[0].message.content.strip()
+        reply = strip_markdown(reply)
         self.messages.append({'role': 'assistant', 'content': reply})
 
         # Trim conversation history to prevent unbounded growth and increasing latency.
@@ -183,7 +228,6 @@ def save_order_from_agent(agent: OrderAgent, call_sid: str = ''):
     order = Order.objects.create(
         customer_name=order_data.get('customer_name', 'Unknown'),
         customer_phone=order_data.get('customer_phone', ''),
-        order_type=order_data.get('order_type', 'pickup'),
         status='new',
         total=order_data.get('total', 0),
         notes=order_data.get('notes', ''),
