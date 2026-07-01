@@ -124,6 +124,11 @@ class OrderAgent:
         reply = response.choices[0].message.content.strip()
         self.messages.append({'role': 'assistant', 'content': reply})
 
+        # Trim conversation history to prevent unbounded growth and increasing latency.
+        # Keep last 20 messages (10 turns). Older context is rarely needed for order-taking.
+        if len(self.messages) > 20:
+            self.messages = self.messages[-20:]
+
         # Check if the model signaled order completion
         self._try_extract_order(reply)
 

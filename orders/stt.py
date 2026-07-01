@@ -72,7 +72,7 @@ class DeepgramSTT:
             sample_rate=8000,
             channels=1,
             interim_results=True,
-            endpointing=500,  # ms of silence before finalizing
+            endpointing=300,  # ms of silence before finalizing (reduced from 500ms for faster turns)
             smart_format=True,
         )
 
