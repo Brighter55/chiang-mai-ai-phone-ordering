@@ -38,7 +38,7 @@ SAMPLE_MENU = [
     {'name': 'Yellow Curry Chicken', 'price': 20.69, 'category': 'Authentic Thai Curry', 'description': 'simmered in coconut curry with onions and potatoes [Gluten Free]', 'modifiers': ['0 - no spice', '1 - mild', '2 - medium', '3 - hot', '4 - very hot', '5 - extra hot', 'add tofu (+$2.09)', 'add chicken (+$3.09)', 'add vegetables (+$2.09)', 'add shrimp (+$4.19)', 'add green beans (+$2.09)', 'add broccoli (+$3.09)', 'add mixed steamed vegetables (+$2.09)']},
 
     # Noodle Soups
-    {'name': 'Chicken Noodle Soup', 'price': 14.49, 'category': 'Noodle Soups', 'description': 'rice noodles, onions, cilantros, bean sprouts with clear broth [Gluten Free]', 'modifiers': ['0 - no spice', '1 - mild', '2 - medium', '3 - hot', '4 - very hot', '5 - extra hot', 'chicken', 'tofu', 'vegetables', 'shrimp', 'add tofu (+$2.09)', 'add chicken (+$3.09)', 'add vegetables (+$2.09)', 'add shrimp (+$4.19)', 'add green beans (+$2.09)', 'add broccoli (+$3.09)', 'add mixed steamed vegetables (+$2.09)']},
+    {'name': 'Chicken Noodle Soup', 'price': 14.49, 'category': 'Noodle Soups', 'description': 'rice noodles, onions, cilantros, bean sprouts with clear broth [Gluten Free]', 'modifiers': ['0 - no spice', '1 - mild', '2 - medium', '3 - hot', '4 - very hot', '5 - extra hot', 'add tofu (+$2.09)', 'add chicken (+$3.09)', 'add vegetables (+$2.09)', 'add shrimp (+$4.19)', 'add green beans (+$2.09)', 'add broccoli (+$3.09)', 'add mixed steamed vegetables (+$2.09)']},
 
     # Beverages
     {'name': 'Blue Moon', 'price': 6.19, 'category': 'Beverages', 'description': '', 'modifiers': []},
