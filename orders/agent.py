@@ -2,6 +2,7 @@
 Conversation agent using OpenAI for restaurant order taking.
 """
 
+import difflib
 import json
 import logging
 import re
@@ -110,6 +111,9 @@ def get_menu_text():
             if addons:
                 lines.append(f'    Add-ons (extra charge): {", ".join(addons)}')
 
+        if item.aliases:
+            lines.append(f'    Aliases: {", ".join(item.aliases)}')
+
         categories[cat].append('\n'.join(lines))
 
     sections = []
@@ -131,6 +135,49 @@ def get_client():
     return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
+def find_menu_matches(transcript: str, menu_items, threshold: float = 0.4) -> dict:
+    """
+    Fuzzy-match words in the customer's transcript against menu item names and aliases.
+
+    Uses difflib.SequenceMatcher (Levenshtein-like) to catch STT mishearings
+    like "kalsoy" → Khao Soi or "pep tai" → Pad Thai.
+
+    Returns dict of {menu_item_name: (similarity_score, matched_word)}
+    for every menu item with a score >= threshold, e.g.
+    {"Khao Soi": (0.43, "kalsoy")}
+    """
+    # Build search index: (searchable_term_lower, menu_name)
+    search_index = []
+    for item in menu_items:
+        search_index.append((item.name.lower(), item.name))
+        for alias in getattr(item, 'aliases', []) or []:
+            search_index.append((alias.lower(), item.name))
+
+    # Generate candidates: individual words + consecutive bigrams
+    # Skip very short words (<3 chars) to avoid spurious matches
+    words = transcript.lower().split()
+    candidates = {w for w in words if len(w) >= 3}
+    for i in range(len(words) - 1):
+        bigram = f'{words[i]} {words[i + 1]}'
+        if len(bigram) >= 3:
+            candidates.add(bigram)
+
+    results = {}
+    for candidate in candidates:
+        best_menu = None
+        best_score = 0.0
+        for search_term, menu_name in search_index:
+            score = difflib.SequenceMatcher(None, candidate, search_term).ratio()
+            if score > best_score:
+                best_score = score
+                best_menu = menu_name
+        if best_score >= threshold and best_menu:
+            if best_menu not in results or best_score > results[best_menu][0]:
+                results[best_menu] = (best_score, candidate)
+
+    return results
+
+
 class OrderAgent:
     """
     Manages a single phone conversation. Tracks conversation state,
@@ -142,15 +189,34 @@ class OrderAgent:
         self.system_prompt = build_system_prompt()
         self.messages = []  # Conversation history (alternating user/assistant)
         self.order = None   # Will hold the extracted order dict when finalized
+        # Pre-fetch menu items for fuzzy matching (constant within a call)
+        from .models import MenuItem
+        self._menu_items = list(MenuItem.objects.filter(available=True))
 
     async def process_transcript(self, text: str) -> str:
         """
         Send the customer's spoken text to OpenAI and get a response.
 
+        Before sending, runs a fuzzy-matching pre-pass against menu items
+        and injects hints for likely mispronunciations (e.g. "kalsoy" → Khao Soi).
+
         Returns the assistant's response text.
         If the response contains an order_complete action, self.order is set.
         """
-        self.messages.append({'role': 'user', 'content': text})
+        # Fuzzy match menu items — inject hints for likely mispronunciations
+        matches = find_menu_matches(text, self._menu_items)
+        if matches:
+            hints = []
+            for menu_name, (score, matched_word) in sorted(
+                    matches.items(), key=lambda x: -x[1][0]):
+                hints.append(f'    "{matched_word}" → {menu_name} (confidence: {score:.0%})')
+            hint_text = '\n'.join(hints)
+            logger.info(f'🔍 Menu fuzzy matches: {hint_text}')
+            augmented = f'{text}\n\n(Hint: the customer may have mispronounced an item.\n{hint_text})'
+        else:
+            augmented = text
+
+        self.messages.append({'role': 'user', 'content': augmented})
 
         # Build messages: system prompt + conversation history
         api_messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages

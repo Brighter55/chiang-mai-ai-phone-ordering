@@ -14,6 +14,10 @@ class MenuItem(models.Model):
         default=list,
         help_text='List of available modifications, e.g. ["extra spicy", "no onions", "extra cheese"]',
     )
+    aliases = models.JSONField(
+        default=list, blank=True,
+        help_text='Phonetic variants / common mispronunciations for STT, e.g. ["kalsoy", "cosign"] for Khao Soi',
+    )
     available = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
