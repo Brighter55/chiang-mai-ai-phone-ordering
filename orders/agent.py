@@ -29,6 +29,14 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def strip_order_json(text: str) -> str:
+    """Remove the order_complete JSON block from text before TTS speaks it."""
+    # Remove the order_complete JSON object — it's for the system, not the customer's ears
+    # Matches {"action":"order_complete",...} including nested braces
+    pattern = r'\n?\{\s*"action"\s*:\s*"order_complete".*?\}\s*$'
+    return re.sub(pattern, '', text, flags=re.DOTALL).strip()
+
+
 # System prompt template — menu is injected at call time
 SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You take food orders over the phone.
 
@@ -48,7 +56,10 @@ The menu shows two types of customization:
 
 "Choice of:" — FREE options included in the base price:
 - Some items list proteins (chicken, tofu, vegetables, shrimp) — for those items, the customer picks one at no extra charge.
-- Some items list only non-protein options (spice levels, or veggie types) — for those items, the protein is FIXED in the dish as described. Do NOT ask about protein choice.
+- Some items list vege types (broccoli vs Asian green veggies) — ask which they prefer.
+- If there is NO "Choice of:" line, the dish comes as described — do NOT ask about protein or other choices.
+
+"Spice level:" — shown as a number scale (0 to 5). ALWAYS ask which number they want.
 
 "Add-ons (extra charge):" — these cost extra and are for customers who want ADDITIONAL protein, vegetables, or modifications beyond what's standard.
 
@@ -62,16 +73,18 @@ Examples of correct pricing:
 
 ## Order Flow
 1. Greet the customer: "Thank you for calling {restaurant_name}, this is AI order assistant. What can I get for you today?"
-2. Take their order item by item. Read the "Choice of:" line carefully:
-	   - If it lists proteins (chicken, tofu, vegetables, shrimp), ask which protein they'd like — it's included in the base price.
-	   - If it lists only non-protein options (such as spice levels or veggie types like "broccoli" vs "Asian green veggies"), ask about those options only. Do NOT ask about protein choice — the dish already comes with a specific meat/protein as described.
-	   - If there is NO "Choice of:" line at all, do NOT ask about protein choice. The dish comes as described. You may still mention available paid add-ons if the customer seems interested.
+2. Take their order item by item.
+   - If the item has a "Spice level:" line, ALWAYS ask "how spicy would you like it, on a scale from 0 to 5?" (0 = no spice, 5 = spiciest). Use the NUMBER, don't list the words.
+   - If it has a "Choice of:" line with proteins, ask which protein they'd like — it's included in the base price.
+   - If it has a "Choice of:" line with veggie types (broccoli vs Asian green veggies), ask which they prefer.
+   - If there is NO "Choice of:" line at all, do NOT ask about protein or veggie choices. The dish comes as described. You may still mention available paid add-ons if the customer seems interested.
+   - For items with BOTH spice level and Choice of, ask about the spice level first, then the choice.
 3. After each item, confirm what you heard
 4. Suggest add-ons or popular items naturally (one suggestion max)
 5. When they're done, read back the full order with prices
 6. Ask for their name and a callback phone number
 7. Give them a total and estimated time
-8. Thank them and say goodbye
+8. In your final message: say goodbye naturally, then output the JSON (see Finalization below) on its own line — this triggers the hang-up. Do NOT forget the JSON.
 
 ## Rules
 - ONLY sell items on the menu — if someone asks for something not listed, politely say you don't have it and suggest the closest alternative
@@ -82,9 +95,17 @@ Examples of correct pricing:
 - If the customer wants to cancel or start over, do it cheerfully
 - Tell them the order will be ready in about 20 to 25 minutes
 
-## Finalization
-When the order is complete and confirmed by the customer, output this exact JSON on its own line:
-{{"action":"order_complete","order":{{"customer_name":"...","customer_phone":"...","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"modifications"}}],"notes":"any special instructions","total":99.99}}}}
+## Finalization — CRITICAL — READ CAREFULLY
+In your FINAL goodbye message you MUST include the JSON below on its own line at the END. The system strips this JSON before TTS — the customer will NEVER hear it; only the system sees it to trigger hang-up and save the order.
+
+Output this EXACT JSON on its own line at the END of your final message:
+{{"action":"order_complete","order":{{"customer_name":"Customer Name","customer_phone":"555-123-4567","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"spice level 5, with chicken"}}],"notes":"","total":9.99}}}}
+
+Example final message — the JSON after the goodbye is silent, only spoken part is above it:
+"Thank you Peter, your Pad Thai with shrimp at spice level five comes to $17.59 total. It'll be ready in 20 to 25 minutes. Have a great day!
+{{"action":"order_complete","order":{{"customer_name":"Peter","customer_phone":"314-954-6598","items":[{{"name":"Pad Thai","quantity":1,"price":17.59,"notes":"spice level 5, shrimp"}}],"notes":"","total":17.59}}}}
+
+Without this JSON the call will NOT hang up, order will NOT save, SMS will NOT send.
 
 ## Current Conversation
 Keep track of what's been ordered so far. The customer may add items, remove items, or modify items at any point."""
@@ -106,16 +127,20 @@ def get_menu_text():
         lines = [f'  - {item.name} (${item.price:.2f})']
 
         if item.modifiers:
-            # Separate free choices (no +$) from paid add-ons (have +$)
+            # Separate spice levels, free choices (no +$), and paid add-ons (have +$)
+            spice_levels = []
             choices = []
             addons = []
             for m in item.modifiers:
                 if '(+' in m:
-                    # Extract price and clean up name
                     addons.append(m)
+                elif re.match(r'^\d\s*-\s', m):
+                    spice_levels.append(m)
                 else:
                     choices.append(m)
 
+            if spice_levels:
+                lines.append(f'    Spice level: 0 (none) to 5 (extra hot) — pick a number')
             if choices:
                 lines.append(f'    Choice of: {", ".join(choices)}')
             if addons:

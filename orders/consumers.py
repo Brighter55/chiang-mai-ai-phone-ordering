@@ -16,9 +16,9 @@ from asgiref.sync import sync_to_async
 from django.conf import settings
 from channels.generic.websocket import AsyncWebsocketConsumer
 
-from .agent import OrderAgent, save_order_from_agent
+from .agent import OrderAgent, save_order_from_agent, strip_order_json
 from .stt import DeepgramSTT
-from .notify import send_order_sms
+from .notify import send_order_sms, get_twilio_client
 
 logger = logging.getLogger(__name__)
 
@@ -276,13 +276,17 @@ class CallConsumer(AsyncWebsocketConsumer):
                 logger.info(f'AI response ({ai_elapsed:.3f}s): {response_text[:100]}...')
                 self._timings.setdefault('openai', []).append(ai_elapsed)
 
-                # Speak the response
-                await self._speak_response(response_text)
+                # Strip order JSON before TTS so it's not spoken aloud
+                spoken_text = strip_order_json(response_text)
+                await self._speak_response(spoken_text)
 
                 # Check if order was finalized
                 if self.agent.is_order_complete and not self.order_saved:
                     self.order_saved = True
                     await self._finalize_order()
+                    # Hang up the call after a brief pause for the goodbye audio
+                    await asyncio.sleep(0.5)
+                    await self._hangup_call()
 
                 turn_total = time.monotonic() - turn_start
                 logger.info(f'⏱ Turn total: {turn_total:.3f}s (AI: {ai_elapsed:.3f}s)')
@@ -369,3 +373,25 @@ class CallConsumer(AsyncWebsocketConsumer):
                 logger.error('Failed to save order from agent data')
         except Exception as e:
             logger.error(f'Order finalization error: {e}')
+
+    async def _hangup_call(self):
+        """
+        Hang up the Twilio call via REST API.
+        Runs synchronously in a thread to avoid blocking the event loop.
+        """
+        def _hangup():
+            client = get_twilio_client()
+            try:
+                client.calls(self.call_sid).update(status='completed')
+                logger.info(f'Call {self.call_sid} hung up successfully')
+                return True
+            except Exception as e:
+                logger.error(f'Failed to hang up call {self.call_sid}: {e}')
+                return False
+
+        if self.call_sid:
+            await sync_to_async(_hangup, thread_sensitive=False)()
+            # Close the WebSocket so Twilio stops the media stream
+            await self.close()
+        else:
+            logger.warning('No call_sid to hang up')
