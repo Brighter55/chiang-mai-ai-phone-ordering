@@ -29,6 +29,8 @@ INSTALLED_APPS = [
     'orders',
 ]
 
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -91,10 +93,33 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# Logging — ensure all app output goes to console
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {'format': '%(levelname)s %(name)s %(message)s'},
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'orders': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+        'daphne': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+    },
+}
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # --- API Keys & Config ---
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')

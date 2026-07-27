@@ -17,6 +17,9 @@ def twilio_voice_webhook(request):
     """
     Called by Twilio when a customer calls your Twilio number.
     Returns TwiML that connects the call to our WebSocket audio stream.
+
+    The restaurant phone has already rung via AT&T call forwarding
+    (no-answer / busy) before this endpoint is hit. The AI just answers.
     """
     call_sid = request.POST.get('CallSid', '')
     caller_phone = request.POST.get('From', '')

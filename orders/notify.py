@@ -33,11 +33,9 @@ def send_order_sms(order):
         for item in order.items.all()
     )
 
-    order_type = 'Pickup' if order.order_type == 'pickup' else 'Delivery'
-
     message = (
         f'🛎️ New Order #{order.id} | {order.customer_name}\n'
-        f'{order_type}\n'
+        f'Pickup\n'
         f'{items_text}\n'
         f'──────────\n'
         f'Total: ${order.total:.2f}\n'
@@ -47,16 +45,21 @@ def send_order_sms(order):
     if order.notes:
         message += f'\n📝 {order.notes}'
 
+    logger.info(f'📨 SMS content for Order #{order.id}:\n{message}')
+
     client = get_twilio_client()
 
-    sms = client.messages.create(
-        body=message,
-        from_=settings.TWILIO_PHONE_NUMBER,
-        to=settings.RESTAURANT_PHONE,
-    )
-
-    order.sms_sent = True
-    order.save(update_fields=['sms_sent'])
-
-    logger.info(f'SMS sent for Order #{order.id}: {sms.sid}')
-    return sms.sid
+    try:
+        sms = client.messages.create(
+            body=message,
+            from_=settings.TWILIO_PHONE_NUMBER,
+            to=settings.RESTAURANT_PHONE,
+        )
+        order.sms_sent = True
+        order.save(update_fields=['sms_sent'])
+        logger.info(f'SMS sent for Order #{order.id}: {sms.sid}')
+        return sms.sid
+    except Exception as e:
+        logger.warning(f'SMS send failed (A2P?): {e} — content was logged above')
+        # Don't mark as sent so it retries later when messaging is active
+        return None

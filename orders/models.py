@@ -14,6 +14,10 @@ class MenuItem(models.Model):
         default=list,
         help_text='List of available modifications, e.g. ["extra spicy", "no onions", "extra cheese"]',
     )
+    aliases = models.JSONField(
+        default=list, blank=True,
+        help_text='Phonetic variants / common mispronunciations for STT, e.g. ["kalsoy", "cosign"] for Khao Soi',
+    )
     available = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -25,10 +29,6 @@ class MenuItem(models.Model):
 
 
 class Order(models.Model):
-    ORDER_TYPES = [
-        ('pickup', 'Pickup'),
-        ('delivery', 'Delivery'),
-    ]
     STATUSES = [
         ('new', 'New'),
         ('confirmed', 'Confirmed'),
@@ -40,7 +40,6 @@ class Order(models.Model):
 
     customer_name = models.CharField(max_length=200)
     customer_phone = models.CharField(max_length=20)
-    order_type = models.CharField(max_length=10, choices=ORDER_TYPES, default='pickup')
     status = models.CharField(max_length=20, choices=STATUSES, default='new')
     total = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     notes = models.TextField(blank=True)
@@ -52,7 +51,7 @@ class Order(models.Model):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f'Order #{self.id} — {self.customer_name} ({self.order_type})'
+        return f'Order #{self.id} — {self.customer_name} (Pickup)'
 
 
 class OrderItem(models.Model):

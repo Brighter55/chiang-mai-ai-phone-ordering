@@ -1,13 +1,41 @@
 """
-Conversation agent using Claude Haiku 4.5 for restaurant order taking.
+Conversation agent using OpenAI for restaurant order taking.
 """
 
+import difflib
 import json
 import logging
+import re
 from django.conf import settings
-from anthropic import Anthropic
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+
+def strip_markdown(text: str) -> str:
+    """Remove common markdown artifacts that would be spoken by TTS."""
+    # Remove bold/italic markers
+    text = re.sub(r'\*{1,3}', '', text)
+    # Remove markdown link syntax [text](url)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Remove backticks (inline and code blocks)
+    text = re.sub(r'`{1,3}', '', text)
+    # Remove heading markers
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    # Collapse multiple spaces into one
+    text = re.sub(r' +', ' ', text)
+    # Collapse multiple newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def strip_order_json(text: str) -> str:
+    """Remove the order_complete JSON block from text before TTS speaks it."""
+    # Remove the order_complete JSON object — it's for the system, not the customer's ears
+    # Matches {"action":"order_complete",...} including nested braces
+    pattern = r'\n?\{\s*"action"\s*:\s*"order_complete".*?\}\s*$'
+    return re.sub(pattern, '', text, flags=re.DOTALL).strip()
+
 
 # System prompt template — menu is injected at call time
 SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You take food orders over the phone.
@@ -18,33 +46,66 @@ SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You ta
 - Confirm each item before moving on
 - Suggest popular items or upsells naturally when appropriate
 - Always repeat the full order before finalizing
+- Speak naturally — NEVER use markdown, bold, asterisks, bullet points, or any special characters in your responses
 
 ## The Menu
 {menu_text}
 
+## Understanding Protein Options & Pricing
+The menu shows two types of customization:
+
+"Choice of:" — FREE options included in the base price:
+- Some items list proteins (chicken, tofu, vegetables, shrimp) — for those items, the customer picks one at no extra charge.
+- Some items list vege types (broccoli vs Asian green veggies) — ask which they prefer.
+- If there is NO "Choice of:" line, the dish comes as described — do NOT ask about protein or other choices.
+
+"Spice level:" — shown as a number scale (0 to 5). ALWAYS ask which number they want.
+
+"Add-ons (extra charge):" — these cost extra and are for customers who want ADDITIONAL protein, vegetables, or modifications beyond what's standard.
+
+Examples of correct pricing:
+- Pad Thai ($17.59) with chicken = $17.59 (chicken is in "Choice of:", no extra charge)
+- Pad Thai ($17.59) with extra chicken = $20.68 (base $17.59 + add chicken $3.09)
+- Pad Thai ($17.59) with tofu = $17.59 (tofu is in "Choice of:", no extra charge)
+- Khao Soi ($17.59) = $17.59 (Khao Soi always comes with chicken drumsticks — no protein choice in "Choice of:")
+- Khao Soi ($17.59) with extra chicken = $20.68 (customer wants extra as a paid add-on)
+- Do NOT tell customers that choosing chicken adds $3 — it only adds $3 if they ask for EXTRA chicken
+
 ## Order Flow
 1. Greet the customer: "Thank you for calling {restaurant_name}, this is AI order assistant. What can I get for you today?"
-2. Ask if this is for pickup or delivery
-3. Take their order item by item — ask about modifications where relevant
-4. After each item, confirm what you heard
-5. Suggest add-ons or popular items naturally (one suggestion max)
-6. When they're done, read back the full order with prices
-7. Ask for their name and a callback phone number
-8. Give them a total and estimated time
-9. Thank them and say goodbye
+2. Take their order item by item.
+   - If the item has a "Spice level:" line, ALWAYS ask "how spicy would you like it, on a scale from 0 to 5?" (0 = no spice, 5 = spiciest). Use the NUMBER, don't list the words.
+   - If it has a "Choice of:" line with proteins, ask which protein they'd like — it's included in the base price.
+   - If it has a "Choice of:" line with veggie types (broccoli vs Asian green veggies), ask which they prefer.
+   - If there is NO "Choice of:" line at all, do NOT ask about protein or veggie choices. The dish comes as described. You may still mention available paid add-ons if the customer seems interested.
+   - For items with BOTH spice level and Choice of, ask about the spice level first, then the choice.
+3. After each item, confirm what you heard
+4. Suggest add-ons or popular items naturally (one suggestion max)
+5. When they're done, read back the full order with prices
+6. Ask for their name and a callback phone number
+7. Give them a total and estimated time
+8. In your final message: say goodbye naturally, then output the JSON (see Finalization below) on its own line — this triggers the hang-up. Do NOT forget the JSON.
 
 ## Rules
 - ONLY sell items on the menu — if someone asks for something not listed, politely say you don't have it and suggest the closest alternative
 - If you're unsure about something, ask the customer to repeat or clarify
 - Keep responses concise — under 2 sentences when possible
 - Do NOT make up prices or items
+- DO NOT use any markdown, asterisks, bold, or formatting symbols in your responses — speak in plain, natural language only
 - If the customer wants to cancel or start over, do it cheerfully
-- For pickup orders: tell them the order will be ready in about 20-25 minutes
-- For delivery orders: tell them delivery typically takes 30-45 minutes
+- Tell them the order will be ready in about 20 to 25 minutes
 
-## Finalization
-When the order is complete and confirmed by the customer, output this exact JSON on its own line:
-{{"action":"order_complete","order":{{"customer_name":"...","customer_phone":"...","order_type":"pickup or delivery","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"modifications"}}],"notes":"any special instructions","total":99.99}}}}
+## Finalization — CRITICAL — READ CAREFULLY
+In your FINAL goodbye message you MUST include the JSON below on its own line at the END. The system strips this JSON before TTS — the customer will NEVER hear it; only the system sees it to trigger hang-up and save the order.
+
+Output this EXACT JSON on its own line at the END of your final message:
+{{"action":"order_complete","order":{{"customer_name":"Customer Name","customer_phone":"555-123-4567","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"spice level 5, with chicken"}}],"notes":"","total":9.99}}}}
+
+Example final message — the JSON after the goodbye is silent, only spoken part is above it:
+"Thank you Peter, your Pad Thai with shrimp at spice level five comes to $17.59 total. It'll be ready in 20 to 25 minutes. Have a great day!
+{{"action":"order_complete","order":{{"customer_name":"Peter","customer_phone":"314-954-6598","items":[{{"name":"Pad Thai","quantity":1,"price":17.59,"notes":"spice level 5, shrimp"}}],"notes":"","total":17.59}}}}
+
+Without this JSON the call will NOT hang up, order will NOT save, SMS will NOT send.
 
 ## Current Conversation
 Keep track of what's been ordered so far. The customer may add items, remove items, or modify items at any point."""
@@ -63,14 +124,36 @@ def get_menu_text():
         cat = item.category or 'Other'
         if cat not in categories:
             categories[cat] = []
-        modifier_str = ''
+        lines = [f'  - {item.name} (${item.price:.2f})']
+
         if item.modifiers:
-            modifier_str = ' [' + ', '.join(item.modifiers) + ']'
-        categories[cat].append(f'  - {item.name} (${item.price:.2f}){modifier_str}')
+            # Separate spice levels, free choices (no +$), and paid add-ons (have +$)
+            spice_levels = []
+            choices = []
+            addons = []
+            for m in item.modifiers:
+                if '(+' in m:
+                    addons.append(m)
+                elif re.match(r'^\d\s*-\s', m):
+                    spice_levels.append(m)
+                else:
+                    choices.append(m)
+
+            if spice_levels:
+                lines.append(f'    Spice level: 0 (none) to 5 (extra hot) — pick a number')
+            if choices:
+                lines.append(f'    Choice of: {", ".join(choices)}')
+            if addons:
+                lines.append(f'    Add-ons (extra charge): {", ".join(addons)}')
+
+        if item.aliases:
+            lines.append(f'    Aliases: {", ".join(item.aliases)}')
+
+        categories[cat].append('\n'.join(lines))
 
     sections = []
     for cat, item_list in categories.items():
-        sections.append(f'### {cat}\n' + '\n'.join(item_list))
+        sections.append(f'{cat}\n' + '\n'.join(item_list))
 
     return '\n\n'.join(sections)
 
@@ -83,62 +166,131 @@ def build_system_prompt():
 
 
 def get_client():
-    """Get Anthropic client."""
-    return Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    """Get OpenAI async client."""
+    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def find_menu_matches(transcript: str, menu_items, threshold: float = 0.4) -> dict:
+    """
+    Fuzzy-match words in the customer's transcript against menu item names and aliases.
+
+    Uses difflib.SequenceMatcher (Levenshtein-like) to catch STT mishearings
+    like "kalsoy" → Khao Soi or "pep tai" → Pad Thai.
+
+    Returns dict of {menu_item_name: (similarity_score, matched_word)}
+    for every menu item with a score >= threshold, e.g.
+    {"Khao Soi": (0.43, "kalsoy")}
+    """
+    # Build search index: (searchable_term_lower, menu_name)
+    search_index = []
+    for item in menu_items:
+        search_index.append((item.name.lower(), item.name))
+        for alias in getattr(item, 'aliases', []) or []:
+            search_index.append((alias.lower(), item.name))
+
+    # Generate candidates: individual words + consecutive bigrams
+    # Skip very short words (<3 chars) to avoid spurious matches
+    words = transcript.lower().split()
+    candidates = {w for w in words if len(w) >= 3}
+    for i in range(len(words) - 1):
+        bigram = f'{words[i]} {words[i + 1]}'
+        if len(bigram) >= 3:
+            candidates.add(bigram)
+
+    results = {}
+    for candidate in candidates:
+        best_menu = None
+        best_score = 0.0
+        for search_term, menu_name in search_index:
+            score = difflib.SequenceMatcher(None, candidate, search_term).ratio()
+            if score > best_score:
+                best_score = score
+                best_menu = menu_name
+        if best_score >= threshold and best_menu:
+            if best_menu not in results or best_score > results[best_menu][0]:
+                results[best_menu] = (best_score, candidate)
+
+    return results
 
 
 class OrderAgent:
     """
     Manages a single phone conversation. Tracks conversation state,
-    sends transcripts to Claude Haiku, and detects finalized orders.
+    sends transcripts to OpenAI, and detects finalized orders.
     """
 
     def __init__(self):
         self.client = get_client()
         self.system_prompt = build_system_prompt()
         self.messages = []  # Conversation history (alternating user/assistant)
-        self.order = None  # Will hold the extracted order dict when finalized
+        self.order = None   # Will hold the extracted order dict when finalized
+        # Pre-fetch menu items for fuzzy matching (constant within a call)
+        from .models import MenuItem
+        self._menu_items = list(MenuItem.objects.filter(available=True))
 
     async def process_transcript(self, text: str) -> str:
         """
-        Send the customer's spoken text to Claude and get a response.
+        Send the customer's spoken text to OpenAI and get a response.
+
+        Before sending, runs a fuzzy-matching pre-pass against menu items
+        and injects hints for likely mispronunciations (e.g. "kalsoy" → Khao Soi).
 
         Returns the assistant's response text.
         If the response contains an order_complete action, self.order is set.
         """
-        self.messages.append({'role': 'user', 'content': text})
+        # Fuzzy match menu items — inject hints for likely mispronunciations
+        matches = find_menu_matches(text, self._menu_items)
+        if matches:
+            hints = []
+            for menu_name, (score, matched_word) in sorted(
+                    matches.items(), key=lambda x: -x[1][0]):
+                hints.append(f'    "{matched_word}" → {menu_name} (confidence: {score:.0%})')
+            hint_text = '\n'.join(hints)
+            logger.info(f'🔍 Menu fuzzy matches: {hint_text}')
+            augmented = f'{text}\n\n(Hint: the customer may have mispronounced an item.\n{hint_text})'
+        else:
+            augmented = text
+
+        self.messages.append({'role': 'user', 'content': augmented})
+
+        # Build messages: system prompt + conversation history
+        api_messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages
 
         try:
-            response = self.client.messages.create(
-                model='claude-haiku-4-5-20251001',
+            response = await self.client.chat.completions.create(
+                model='gpt-4o-mini',
                 max_tokens=300,
-                system=self.system_prompt,
-                messages=self.messages,
+                messages=api_messages,
             )
         except Exception as e:
-            logger.error(f'Claude API error: {e}')
+            logger.error(f'OpenAI API error: {e}')
             return "I'm sorry, I didn't quite catch that. Could you repeat it?"
 
-        reply = response.content[0].text.strip()
+        reply = response.choices[0].message.content.strip()
+        reply = strip_markdown(reply)
         self.messages.append({'role': 'assistant', 'content': reply})
 
-        # Check if Claude signaled order completion
+        # Trim conversation history to prevent unbounded growth and increasing latency.
+        # Keep last 20 messages (10 turns). Older context is rarely needed for order-taking.
+        if len(self.messages) > 20:
+            self.messages = self.messages[-20:]
+
+        # Check if the model signaled order completion
         self._try_extract_order(reply)
 
         return reply
 
     def _try_extract_order(self, text: str):
-        """Look for the order_complete JSON in Claude's response."""
+        """Look for the order_complete JSON in the response."""
         try:
             # Find JSON block in the response
             start = text.find('{"action":"order_complete"')
             if start == -1:
                 return
 
-            # Extract just the JSON part
-            end = text.find('}', start)
             # Find matching closing brace
             brace_count = 0
+            end = start
             for i in range(start, len(text)):
                 if text[i] == '{':
                     brace_count += 1
@@ -177,7 +329,6 @@ def save_order_from_agent(agent: OrderAgent, call_sid: str = ''):
     order = Order.objects.create(
         customer_name=order_data.get('customer_name', 'Unknown'),
         customer_phone=order_data.get('customer_phone', ''),
-        order_type=order_data.get('order_type', 'pickup'),
         status='new',
         total=order_data.get('total', 0),
         notes=order_data.get('notes', ''),

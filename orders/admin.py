@@ -14,8 +14,8 @@ class OrderItemInline(admin.TabularInline):
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ['id', 'customer_name', 'customer_phone', 'order_type', 'status', 'total', 'sms_sent', 'created_at']
-    list_filter = ['status', 'order_type', 'sms_sent', 'created_at']
+    list_display = ['id', 'customer_name', 'customer_phone', 'status', 'total', 'sms_sent', 'created_at']
+    list_filter = ['status', 'sms_sent', 'created_at']
     search_fields = ['customer_name', 'customer_phone', 'notes']
     inlines = [OrderItemInline]
     readonly_fields = ['call_sid']
