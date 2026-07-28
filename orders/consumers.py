@@ -263,10 +263,22 @@ class CallConsumer(AsyncWebsocketConsumer):
     async def _process_transcripts(self):
         """
         Background task: process queued transcripts through AI and TTS.
+
+        If no transcript arrives within NUDGE_TIMEOUT seconds, the AI nudges
+        the customer (instead of staying silent forever). After MAX_NUDGES
+        unanswered nudges, says goodbye and hangs up.
         """
+        NUDGE_TIMEOUT = 8.0   # Seconds of silence before nudging
+        MAX_NUDGES = 2        # Number of nudges before hanging up
+        nudge_count = 0
+
         while True:
             try:
-                transcript = await self.transcript_queue.get()
+                transcript = await asyncio.wait_for(
+                    self.transcript_queue.get(),
+                    timeout=NUDGE_TIMEOUT,
+                )
+                nudge_count = 0  # Reset — customer is speaking
                 turn_start = time.monotonic()
 
                 # Send to AI for a response
@@ -292,6 +304,22 @@ class CallConsumer(AsyncWebsocketConsumer):
                 logger.info(f'⏱ Turn total: {turn_total:.3f}s (AI: {ai_elapsed:.3f}s)')
                 self._timings.setdefault('turn_total', []).append(turn_total)
 
+            except asyncio.TimeoutError:
+                nudge_count += 1
+                if nudge_count > MAX_NUDGES:
+                    logger.info('Max nudges reached — hanging up')
+                    await self._speak_response(
+                        "I'm sorry, I'm having trouble hearing you. "
+                        "Please call back and try again. Goodbye!"
+                    )
+                    await asyncio.sleep(0.5)
+                    await self._hangup_call()
+                    break
+                logger.info(f'Nudge #{nudge_count} — no transcript for {NUDGE_TIMEOUT}s')
+                await self._speak_response(
+                    "I'm sorry, I didn't catch that. Could you repeat?"
+                )
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -310,7 +338,7 @@ class CallConsumer(AsyncWebsocketConsumer):
         tts_start = time.monotonic()
         try:
             dg_api_key = settings.DEEPGRAM_API_KEY
-            url = 'https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000'
+            url = 'https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&rate=1.2'
 
             headers = {
                 'Authorization': f'Token {dg_api_key}',
