@@ -343,7 +343,7 @@ class CallConsumer(AsyncWebsocketConsumer):
         tts_start = time.monotonic()
         try:
             dg_api_key = settings.DEEPGRAM_API_KEY
-            url = 'https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&rate=1.2'
+            url = f'https://api.deepgram.com/v1/speak?model={settings.DEEPGRAM_TTS_MODEL}&encoding=mulaw&sample_rate=8000&rate={settings.DEEPGRAM_TTS_RATE}'
 
             headers = {
                 'Authorization': f'Token {dg_api_key}',
