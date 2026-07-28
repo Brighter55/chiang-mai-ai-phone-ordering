@@ -50,6 +50,7 @@ class CallConsumer(AsyncWebsocketConsumer):
         self._barge_in_triggered = False # True when customer interrupts AI
         self._barge_in_cooldown_until = 0.0  # monotonic timestamp — no barge-in until after this
         self._barge_in_enabled = False   # Disabled by default — echo makes it unreliable on phone calls
+        self.greeting_done = asyncio.Event()  # Set when the greeting TTS finishes
         # Timing instrumentation
         self._timings = {}         # Stage → list of durations
 
@@ -189,8 +190,9 @@ class CallConsumer(AsyncWebsocketConsumer):
             return
 
         restaurant = getattr(settings, 'RESTAURANT_NAME', 'Our Restaurant')
-        greeting = f"Thank you for calling {restaurant}, this is AI order assistant. What can I get for you today?"
+        greeting = f"Thank you for calling {restaurant}. All our staff are currently busy assisting other customers, but I can take your order right away. What can I get for you today?"
         await self._speak_response(greeting)
+        self.greeting_done.set()
         logger.info('Greeting completed, ready for customer speech')
 
     def _on_transcript(self, transcript: str):
@@ -271,6 +273,9 @@ class CallConsumer(AsyncWebsocketConsumer):
         NUDGE_TIMEOUT = 8.0   # Seconds of silence before nudging
         MAX_NUDGES = 2        # Number of nudges before hanging up
         nudge_count = 0
+
+        # Wait for greeting to finish before starting the silence timer
+        await self.greeting_done.wait()
 
         while True:
             try:
