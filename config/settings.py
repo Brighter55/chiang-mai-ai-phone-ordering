@@ -126,3 +126,8 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 RESTAURANT_PHONE = os.getenv('RESTAURANT_PHONE')
 RESTAURANT_NAME = os.getenv('RESTAURANT_NAME', 'Our Restaurant')
+
+# TTS (Text-to-Speech) — Deepgram Aura voice model
+# See https://developers.deepgram.com/api-reference/speak-api/
+DEEPGRAM_TTS_MODEL = os.getenv('DEEPGRAM_TTS_MODEL', 'aura-asteria-en')
+DEEPGRAM_TTS_RATE = os.getenv('DEEPGRAM_TTS_RATE', '1.2')
