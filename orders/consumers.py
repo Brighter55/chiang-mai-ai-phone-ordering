@@ -16,7 +16,7 @@ from asgiref.sync import sync_to_async
 from django.conf import settings
 from channels.generic.websocket import AsyncWebsocketConsumer
 
-from .agent import OrderAgent, save_order_from_agent, strip_order_json
+from .agent import OrderAgent, build_keyterms, save_order_from_agent, strip_order_json
 from .stt import DeepgramSTT
 from .notify import send_order_sms, get_twilio_client
 
@@ -65,7 +65,8 @@ class CallConsumer(AsyncWebsocketConsumer):
         # Start STT immediately so we don't miss early speech.
         # Transcripts during greeting are filtered via is_speaking flag.
         # The keepalive prevents Deepgram's idle timeout during the greeting.
-        self.stt = DeepgramSTT(on_transcript=self._on_transcript)
+        self.stt = DeepgramSTT(on_transcript=self._on_transcript,
+                               keyterms=build_keyterms(self.agent.menu_items))
         await self.stt.connect()
         logger.info('Deepgram STT started (before greeting)')
 

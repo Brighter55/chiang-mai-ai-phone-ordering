@@ -18,6 +18,10 @@ class MenuItem(models.Model):
         default=list, blank=True,
         help_text='Phonetic variants / common mispronunciations for STT, e.g. ["kalsoy", "cosign"] for Khao Soi',
     )
+    thai_name = models.CharField(
+        max_length=200, blank=True,
+        help_text='Thai script name, e.g. ข้าวซอย for Khao Soi. Used for matching when Thai speakers say the real name.',
+    )
     available = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

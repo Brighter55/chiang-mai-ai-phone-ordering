@@ -1,8 +1,6 @@
 """
 Conversation agent using OpenAI for restaurant order taking.
 """
-
-import difflib
 import json
 import logging
 import re
@@ -44,9 +42,16 @@ SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You ta
 - Be friendly, warm, and efficient — like a great server
 - Take orders conversationally, one step at a time
 - Confirm each item before moving on
-- Suggest popular items or upsells naturally when appropriate
 - Always repeat the full order before finalizing
 - Speak naturally — NEVER use markdown, bold, asterisks, bullet points, or any special characters in your responses
+
+## Matching Customer Speech to Menu Items — CRITICAL
+Customers may pronounce dish names in many ways: with a Thai accent, with an English accent, or using descriptive phrases instead of the menu name. You MUST match what they say to the correct menu item using:
+- **Sound/phonetic matching**: "cow soy" or "kao soi" → Khao Soi. "pat tie" or "put tie" → Pad Thai. "sigh ooh ah" → Sai Oua. "gang hung lay" → Gaeng Hung Lay.
+- **Thai name matching**: if a customer says the Thai name (e.g. "kao pad" = ข้าวผัด = Fried rice, "pad kee mao" = ผัดขี้เมา = Drunken Noodles, "pad krapow" = ผัดกะเพรา = Spicy Basil), match it to the correct menu item. The menu lists Thai script and common Thai pronunciations for each dish — use them.
+- **Description matching**: if a customer describes a dish ("the curry noodle soup", "the basil stir fry", "the papaya salad"), match it to the correct item.
+- **Partial/fuzzy matching**: if a customer says something close but not exact ("massaman" instead of "Massaman Beef", "drunken noodle" instead of "Drunken Noodles"), use your judgment to find the closest match.
+- When in doubt, confirm: "Did you mean [menu item name]?"
 
 ## The Menu
 {menu_text}
@@ -80,12 +85,11 @@ Examples of correct pricing:
    - If there is NO "Choice of:" line at all, do NOT ask about protein or veggie choices. The dish comes as described. You may still mention available paid add-ons if the customer seems interested.
    - For items with BOTH spice level and Choice of, ask about the spice level first, then the choice.
 3. After each item, confirm what you heard
-4. Suggest add-ons or popular items naturally (one suggestion max)
-5. When they're done, read back the full order with prices
-6. Ask for their name — just their name, nothing else
-7. After they give you their name, then ask for a callback phone number
-8. Give them a total and estimated time
-9. In your final message: say goodbye naturally, then output the JSON (see Finalization below) on its own line — this triggers the hang-up. Do NOT forget the JSON.
+4. When they're done, read back the full order with prices
+5. Ask for their name — just their name, nothing else
+6. After they give you their name, then ask for a callback phone number
+7. Give them a total and estimated time
+8. In your final message: say goodbye naturally, then output the JSON (see Finalization below) on its own line — this triggers the hang-up. Do NOT forget the JSON.
 
 ## Rules
 - ONLY sell items on the menu — if someone asks for something not listed, politely say you don't have it and suggest the closest alternative
@@ -125,7 +129,11 @@ def get_menu_text():
         cat = item.category or 'Other'
         if cat not in categories:
             categories[cat] = []
-        lines = [f'  - {item.name} (${item.price:.2f})']
+        # Include Thai name in the menu listing for cross-lingual matching
+        if item.thai_name:
+            lines = [f'  - {item.name} — {item.thai_name} — ${item.price:.2f}']
+        else:
+            lines = [f'  - {item.name} — ${item.price:.2f}']
 
         if item.modifiers:
             # Separate spice levels, free choices (no +$), and paid add-ons (have +$)
@@ -148,7 +156,7 @@ def get_menu_text():
                 lines.append(f'    Add-ons (extra charge): {", ".join(addons)}')
 
         if item.aliases:
-            lines.append(f'    Aliases: {", ".join(item.aliases)}')
+            lines.append(f'    Pronunciations: {", ".join(item.aliases)}')
 
         categories[cat].append('\n'.join(lines))
 
@@ -171,47 +179,60 @@ def get_client():
     return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
-def find_menu_matches(transcript: str, menu_items, threshold: float = 0.4) -> dict:
-    """
-    Fuzzy-match words in the customer's transcript against menu item names and aliases.
+def build_keyterms(menu_items, max_chars: int = 800):
+    """Curated keyterm list for Deepgram STT biasing.
 
-    Uses difflib.SequenceMatcher (Levenshtein-like) to catch STT mishearings
-    like "kalsoy" → Khao Soi or "pep tai" → Pad Thai.
+    Deepgram's keyterm param biases decoding toward known vocabulary —
+    mispronounced dish names ("hot tire" → pad thai) get pulled to the closest
+    menu term. The server rejects oversized lists (verified empirically:
+    ~100 terms / ~800 chars connect fine, ~1400 chars gets HTTP 400), so we
+    curate to the most phonetically distinctive terms: multi-word names first
+    (most likely to be mispronounced, most informative), then multi-word
+    aliases, then single-word names, capped by total characters. Aliases also
+    appear in the prompt's "Pronunciations:" lines, so keyterm hits map cleanly.
 
-    Returns dict of {menu_item_name: (similarity_score, matched_word)}
-    for every menu item with a score >= threshold, e.g.
-    {"Khao Soi": (0.43, "kalsoy")}
+    Returns a deduped, lowercase list.
     """
-    # Build search index: (searchable_term_lower, menu_name)
-    search_index = []
+    # Skip beverage categories — brand names are said directly (low garble
+    # risk) and they eat the character budget needed for dish names
+    SKIP_CATEGORIES = {'Beverages', 'NA Beverages'}
+
+    def is_food(item):
+        return (getattr(item, 'category', '') or '').strip() not in SKIP_CATEGORIES
+
+    seen = set()
+    keyterms = []
+
+    def add(term):
+        # Strip container-size suffixes ("Dreamy Clouds 300 mL") — noise for STT
+        term = re.sub(r'\s+\d+\s*ml$', '', (term or '').strip().lower())
+        if term and term not in seen:
+            seen.add(term)
+            keyterms.append(term)
+
+    # Each dish gets its name + aliases together — aliases are the
+    # mispronunciation vocabulary keyterm biasing exists for
     for item in menu_items:
-        search_index.append((item.name.lower(), item.name))
+        if not is_food(item):
+            continue
+        if len(item.name.split()) >= 2:
+            add(item.name)
         for alias in getattr(item, 'aliases', []) or []:
-            search_index.append((alias.lower(), item.name))
+            if len(alias) >= 4:  # short aliases like 'ribs' are cheap and safe
+                add(alias)
+    # Single-word names last (cheap, low garble risk)
+    for item in menu_items:
+        if is_food(item) and len(item.name.split()) == 1:
+            add(item.name)
 
-    # Generate candidates: individual words + consecutive bigrams
-    # Skip very short words (<3 chars) to avoid spurious matches
-    words = transcript.lower().split()
-    candidates = {w for w in words if len(w) >= 3}
-    for i in range(len(words) - 1):
-        bigram = f'{words[i]} {words[i + 1]}'
-        if len(bigram) >= 3:
-            candidates.add(bigram)
-
-    results = {}
-    for candidate in candidates:
-        best_menu = None
-        best_score = 0.0
-        for search_term, menu_name in search_index:
-            score = difflib.SequenceMatcher(None, candidate, search_term).ratio()
-            if score > best_score:
-                best_score = score
-                best_menu = menu_name
-        if best_score >= threshold and best_menu:
-            if best_menu not in results or best_score > results[best_menu][0]:
-                results[best_menu] = (best_score, candidate)
-
-    return results
+    # Cap by total characters — cut the tail (list is ordered by value)
+    trimmed, budget = [], max_chars
+    for term in keyterms:
+        if budget - len(term) < 0:
+            break
+        trimmed.append(term)
+        budget -= len(term)
+    return trimmed
 
 
 class OrderAgent:
@@ -225,34 +246,18 @@ class OrderAgent:
         self.system_prompt = build_system_prompt()
         self.messages = []  # Conversation history (alternating user/assistant)
         self.order = None   # Will hold the extracted order dict when finalized
-        # Pre-fetch menu items for fuzzy matching (constant within a call)
+        # Pre-fetch menu items (shared with STT keyterm biasing)
         from .models import MenuItem
-        self._menu_items = list(MenuItem.objects.filter(available=True))
+        self.menu_items = list(MenuItem.objects.filter(available=True))
 
     async def process_transcript(self, text: str) -> str:
         """
         Send the customer's spoken text to OpenAI and get a response.
 
-        Before sending, runs a fuzzy-matching pre-pass against menu items
-        and injects hints for likely mispronunciations (e.g. "kalsoy" → Khao Soi).
-
         Returns the assistant's response text.
         If the response contains an order_complete action, self.order is set.
         """
-        # Fuzzy match menu items — inject hints for likely mispronunciations
-        matches = find_menu_matches(text, self._menu_items)
-        if matches:
-            hints = []
-            for menu_name, (score, matched_word) in sorted(
-                    matches.items(), key=lambda x: -x[1][0]):
-                hints.append(f'    "{matched_word}" → {menu_name} (confidence: {score:.0%})')
-            hint_text = '\n'.join(hints)
-            logger.info(f'🔍 Menu fuzzy matches: {hint_text}')
-            augmented = f'{text}\n\n(Hint: the customer may have mispronounced an item.\n{hint_text})'
-        else:
-            augmented = text
-
-        self.messages.append({'role': 'user', 'content': augmented})
+        self.messages.append({'role': 'user', 'content': text})
 
         # Build messages: system prompt + conversation history
         api_messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages

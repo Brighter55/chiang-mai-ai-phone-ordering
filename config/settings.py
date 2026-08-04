@@ -129,5 +129,6 @@ RESTAURANT_NAME = os.getenv('RESTAURANT_NAME', 'Our Restaurant')
 
 # TTS (Text-to-Speech) — Deepgram Aura voice model
 # See https://developers.deepgram.com/api-reference/speak-api/
+DEEPGRAM_STT_MODEL = os.getenv('DEEPGRAM_STT_MODEL', 'nova-3-general')
 DEEPGRAM_TTS_MODEL = os.getenv('DEEPGRAM_TTS_MODEL', 'aura-asteria-en')
 DEEPGRAM_TTS_RATE = os.getenv('DEEPGRAM_TTS_RATE', '1.2')
