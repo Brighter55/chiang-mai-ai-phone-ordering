@@ -34,15 +34,18 @@ class DeepgramSTT:
         await stt.close()
     """
 
-    def __init__(self, on_transcript: Callable[[str], None], keepalive_interval: float = 5.0):
+    def __init__(self, on_transcript: Callable[[str], None], keyterms: list = None, keepalive_interval: float = 5.0):
         """
         Args:
             on_transcript: Called with the final transcript string
                            when the customer finishes speaking.
+            keyterms: Menu vocabulary phrases to bias transcription toward
+                      (Deepgram keyterm prompting — helps mispronounced dish names).
             keepalive_interval: Seconds between keepalive silence frames
                                 (default 5s — Deepgram idle timeout is ~10s).
         """
         self.on_transcript = on_transcript
+        self.keyterms = keyterms or []
         self.dg_client = None
         self.dg_connection = None
         self._transcript_buffer = ''
@@ -66,7 +69,7 @@ class DeepgramSTT:
 
         # Configure for phone call audio (8kHz mulaw is Twilio's format)
         options = LiveOptions(
-            model='nova-2-phonecall',
+            model=settings.DEEPGRAM_STT_MODEL,
             language='en-US',
             encoding='mulaw',
             sample_rate=8000,
@@ -75,10 +78,13 @@ class DeepgramSTT:
             endpointing=300,  # ms of silence before finalizing (reduced from 500ms for faster turns)
             smart_format=True,
         )
+        # Bias decoding toward menu vocabulary (mispronounced dish names)
+        if self.keyterms:
+            options.keyterm = self.keyterms
 
         self.dg_connection.start(options)
         self._last_audio_sent = time.monotonic()
-        logger.info('Deepgram STT connected')
+        logger.info(f'Deepgram STT connected (model={options.model})')
 
         # Start keepalive to prevent Deepgram idle timeout (~10s)
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())

@@ -38,7 +38,7 @@ The `/start-testing-env` skill launches Daphne, an ngrok tunnel, and a log monit
 ```
 Twilio call → POST /twilio/voice/ → TwiML <Connect><Stream url="ws(s)://host/ws/call/">
     → CallConsumer (WebSocket, one instance per call)
-        → DeepgramSTT (streaming WebSocket, nova-2-phonecall, 8kHz mulaw)
+        → DeepgramSTT (streaming WebSocket, nova-3-general via env, 8kHz mulaw, menu keyterms)
         → OrderAgent (OpenAI gpt-4o-mini)
         → Deepgram Aura TTS (HTTP POST, inline in consumer) → audio frames back to Twilio
     → order complete → save_order_from_agent → send_order_sms → hangup via Twilio REST
@@ -49,8 +49,8 @@ Twilio call → POST /twilio/voice/ → TwiML <Connect><Stream url="ws(s)://host
 - `config/asgi.py` — `ProtocolTypeRouter`: HTTP → Django, WebSocket → `orders/routing.py` (`/ws/call/`). Server must run under Daphne (ASGI), not `runserver`.
 - `orders/views.py` — Twilio webhooks: `twilio_voice_webhook` (returns the Stream TwiML; builds ws/wss URL from the request host) and `twilio_sms_status`. Both `@csrf_exempt`. Real paths are `/twilio/voice/` and `/twilio/sms-status/` (mounted under `twilio/` in `config/urls.py`).
 - `orders/consumers.py` — `CallConsumer`, the core pipeline. Lifecycle: `connect` → `receive` (media loop) → `disconnect`. See "Key mechanisms" below.
-- `orders/stt.py` — `DeepgramSTT` wrapper: async connect, sync `send_audio`, JSON `KeepAlive` every 5s to beat Deepgram's ~10s idle timeout, `endpointing=300`ms. Callback `on_transcript` fires on `speech_final` transcripts.
-- `orders/agent.py` — `OrderAgent` builds the system prompt **per call** from `SYSTEM_PROMPT.format(menu_text=get_menu_text())` where menu text comes from the DB. Also: `find_menu_matches` (difflib fuzzy matching of transcript words/bigrams against item names + aliases, hints injected into the prompt), `strip_markdown`, `strip_order_json`, `save_order_from_agent`.
+- `orders/stt.py` — `DeepgramSTT` wrapper: async connect, sync `send_audio`, JSON `KeepAlive` every 5s to beat Deepgram's ~10s idle timeout, `endpointing=300`ms. Model from `DEEPGRAM_STT_MODEL` env (default `nova-3-general`); `keyterm` biases decoding toward menu vocabulary (`build_keyterms`). Callback `on_transcript` fires on `speech_final` transcripts.
+- `orders/agent.py` — `OrderAgent` builds the system prompt **per call** from `SYSTEM_PROMPT.format(menu_text=get_menu_text())` where menu text comes from the DB (includes aliases as "Pronunciations:" lines). Also: `build_keyterms` (curated menu vocabulary fed to STT keyterm biasing), `strip_markdown`, `strip_order_json`, `save_order_from_agent`.
 - `orders/notify.py` — `get_twilio_client`, `send_order_sms` (formatted SMS; on failure logs content and leaves `sms_sent=False` for retry).
 - `orders/tts.py` — legacy Twilio `<Say>` helper; `text_to_media_stream_audio` raises NotImplementedError. Real TTS lives inline in `CallConsumer._speak_response` (Deepgram HTTP API, mulaw/8kHz, streamed in 160-byte/20ms frames).
 
@@ -71,11 +71,11 @@ Twilio call → POST /twilio/voice/ → TwiML <Connect><Stream url="ws(s)://host
   - contains `'(+$X)'` (e.g. `'add chicken (+$3.09)'`) → "Add-ons (extra charge):" — paid
   - anything else (e.g. `'chicken'`, `'broccoli'`) → "Choice of:" — free
   - Keep this format when editing menu items; the AI's pricing rules in `SYSTEM_PROMPT` depend on it (free choices vs paid add-ons).
-- `aliases` hold phonetic variants ("kalsoy" → Khao Soi) used by fuzzy matching.
+- `aliases` hold phonetic variants ("kalsoy" → Khao Soi). They feed two things: the STT `keyterm` list (`build_keyterms`) and the prompt's "Pronunciations:" lines. Adding aliases like `garlic moo` for Gra Dook Moo fixes Thai-English phrase recognition.
 
 ## Configuration
 
-- `.env` (gitignored) is loaded via `python-dotenv` in `config/settings.py`. Copy `.env.example`. Keys: `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `DEEPGRAM_TTS_MODEL` (default `aura-asteria-en`), `DEEPGRAM_TTS_RATE` (default `1.2`), `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `RESTAURANT_PHONE`, `RESTAURANT_NAME`.
+- `.env` (gitignored) is loaded via `python-dotenv` in `config/settings.py`. Copy `.env.example`. Keys: `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `DEEPGRAM_STT_MODEL` (default `nova-3-general`), `DEEPGRAM_TTS_MODEL` (default `aura-asteria-en`), `DEEPGRAM_TTS_RATE` (default `1.2`), `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `RESTAURANT_PHONE`, `RESTAURANT_NAME`.
 - DB defaults to PostgreSQL via env vars (`DB_NAME`, `DB_USER`, ...); channel layer is in-memory (dev only).
 - Logging: console INFO; `orders` and `daphne` loggers. Emoji-prefixed log lines (`🎙`, `🔇`, `⏱`) mark call pipeline stages.
 - Deployment: `render.yaml` blueprint — Daphne start command, `migrate` pre-deploy.
