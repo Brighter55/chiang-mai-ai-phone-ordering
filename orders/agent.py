@@ -79,31 +79,37 @@ Customers may pronounce dish names in many ways: with a Thai accent, with an Eng
 ## Understanding Protein Options & Pricing
 The menu shows two types of customization:
 
-"Choice of:" — FREE options included in the base price:
-- Some items list proteins (chicken, tofu, vegetables, shrimp) — for those items, the customer picks one at no extra charge.
+"Choice of:" — options the customer picks from. Options WITHOUT a price are included in the base price; options that show (+$X) cost that extra amount:
+- Some items list proteins (chicken, tofu, vegetables, shrimp) — the customer picks one. If the option has no price it's free; if it shows (+$X), picking that option costs the extra amount.
 - Some items list vege types (broccoli vs Asian green veggies) — ask which they prefer.
+- Some items are a single "pick one" set where some options cost extra (e.g. Poh Piah: vegetables, cheese, pork (+$3.09), shrimps (+$3.09)) — present ALL the options and note any that have a price.
 - If there is NO "Choice of:" line, the dish comes as described — do NOT ask about protein or other choices.
 
-"Spice level:" — shown as a number scale (0 to 5). ALWAYS ask which number they want.
+"Spice level:" — shown as a number scale (0 to 5). ONLY ask about spice if the dish's menu entry shows a "Spice level:" line. If it does NOT show one, do NOT ask about spice — the dish comes as-is.
 
-"Add-ons (extra charge):" — these cost extra and are for customers who want ADDITIONAL protein, vegetables, or modifications beyond what's standard.
+"Add-ons (extra charge):" — these cost extra and are for customers who want ADDITIONAL protein, vegetables, or modifications beyond what's standard. They are optional — only offer them if the customer wants more.
+
+CRITICAL — before asking any customization question, read that specific dish's menu entry and ask ONLY what its entry lists. Never assume a dish has spice or a protein choice just because a similar dish does.
 
 Examples of correct pricing:
 - Pad Thai ($17.59) with chicken = $17.59 (chicken is in "Choice of:", no extra charge)
 - Pad Thai ($17.59) with extra chicken = $20.68 (base $17.59 + add chicken $3.09)
 - Pad Thai ($17.59) with tofu = $17.59 (tofu is in "Choice of:", no extra charge)
+- Poh Piah ($6.19) with pork filling = $9.28 (pork (+$3.09) is a paid option in "Choice of:")
 - Khao Soi ($17.59) = $17.59 (Khao Soi always comes with chicken drumsticks — no protein choice in "Choice of:")
 - Khao Soi ($17.59) with extra chicken = $20.68 (customer wants extra as a paid add-on)
 - Do NOT tell customers that choosing chicken adds $3 — it only adds $3 if they ask for EXTRA chicken
 
 ## Order Flow
 1. The opening greeting is played automatically by the system before your first turn — go straight to taking the order. If the customer asks "who is this?" or "what can you do?", briefly explain you can take their food order for {restaurant_name}.
-2. Take their order item by item.
-   - If the item has a "Spice level:" line, ALWAYS ask "how spicy would you like it, on a scale from 0 to 5?" (0 = no spice, 5 = spiciest). Use the NUMBER, don't list the words.
-   - If it has a "Choice of:" line with proteins, ask which protein they'd like — it's included in the base price.
-   - If it has a "Choice of:" line with veggie types (broccoli vs Asian green veggies), ask which they prefer.
-   - If there is NO "Choice of:" line at all, do NOT ask about protein or veggie choices. The dish comes as described. You may still mention available paid add-ons if the customer seems interested.
-   - For items with BOTH spice level and Choice of, ask about the spice level first, then the choice.
+2. Take their order item by item. For EACH item, read its menu entry and ask ONLY what the entry shows:
+   - Ask about spice ONLY if the entry has a "Spice level:" line: "how spicy would you like it, on a scale from 0 to 5?" (0 = no spice, 5 = spiciest). Use the NUMBER, don't list the words.
+   - Ask about a choice ONLY if the entry has a "Choice of:" line. Present ALL the options in that line, and note any that have a price (e.g. Poh Piah: "Which filling? Vegetables, cheese, pork (+$3.09), or shrimps (+$3.09)?").
+     - If the line lists proteins, ask which they'd like.
+     - If it lists veggie types (broccoli vs Asian green veggies), ask which they prefer.
+     - If it lists both proteins and veggie types (e.g. Pad See Ew), ask the protein first, then the veggie.
+   - If there is NO "Spice level:" or "Choice of:" line, do NOT ask about spice or choices — the dish comes as described. You may still mention paid add-ons if the customer seems interested.
+   - For items with BOTH spice level and a choice, ask about the spice level first, then the choice.
 3. After each item, confirm what you heard
 4. When they're done, read back the full order with prices
 5. Ask for their name — just their name, nothing else
@@ -152,20 +158,22 @@ def get_menu_text():
             lines = [f'  - {item.name} — ${item.price:.2f}']
 
         if item.modifiers:
-            # Separate spice levels, free choices (no +$), and paid add-ons (have +$)
+            # Separate spice levels, add-ons ("add X"), and choices.
+            # Choices may be free ("chicken") or priced alternatives that keep
+            # their price ("pork (+$3.09)") — both render in "Choice of:".
             spice_levels = []
             choices = []
             addons = []
             for m in item.modifiers:
-                if '(+' in m:
-                    addons.append(m)
-                elif re.match(r'^\d\s*-\s', m):
+                if re.match(r'^\d\s*-\s', m):
                     spice_levels.append(m)
+                elif re.match(r'^add\s', m, re.IGNORECASE):
+                    addons.append(m)
                 else:
                     choices.append(m)
 
             if spice_levels:
-                lines.append(f'    Spice level: 0 (none) to 5 (extra hot) — pick a number')
+                lines.append('    Spice level: 0 (none) to 5 (extra hot) — pick a number')
             if choices:
                 lines.append(f'    Choice of: {", ".join(choices)}')
             if addons:
@@ -181,6 +189,15 @@ def get_menu_text():
         sections.append(f'{cat}\n' + '\n'.join(item_list))
 
     return '\n\n'.join(sections)
+
+
+# Deepgram hard-caps keyterm biasing at 500 tokens across ALL keyterms
+# (verified empirically on this list: ~2 tokens per word, so ~240 words apply
+# but ~246 fail with FAILED_TO_START_LISTENING). Keep the total word count
+# under this budget with margin so a future "add more keyterms" can't silently
+# break every call. Primary control is a curated _dg_keyterms.txt; this cap is
+# a backstop that drops the longest (least distinctive) terms first.
+MAX_KEYTERM_WORDS = 220
 
 
 def load_keyterms():
@@ -202,6 +219,21 @@ def load_keyterms():
         if term and not term.startswith('#') and term not in seen:
             seen.add(term)
             keyterms.append(term)
+
+    total_words = sum(len(term.split()) for term in keyterms)
+    if total_words > MAX_KEYTERM_WORDS:
+        dropped = []
+        while sum(len(t.split()) for t in keyterms) > MAX_KEYTERM_WORDS:
+            longest = max(keyterms, key=lambda t: len(t.split()))
+            keyterms.remove(longest)
+            dropped.append(longest)
+        logger.warning(
+            'Keyterm budget exceeded (%d words > %d) — dropped %d keyterms '
+            '(longest first) to fit Deepgram\'s 500-token limit: %s',
+            total_words, MAX_KEYTERM_WORDS, len(dropped),
+            ', '.join(dropped[:10]) + ('…' if len(dropped) > 10 else ''),
+        )
+
     logger.info(f'Loaded {len(keyterms)} STT keyterms from {path.name}')
     return keyterms
 
