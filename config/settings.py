@@ -119,7 +119,6 @@ LOGGING = {
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # --- API Keys & Config ---
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
@@ -127,8 +126,11 @@ TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 RESTAURANT_PHONE = os.getenv('RESTAURANT_PHONE')
 RESTAURANT_NAME = os.getenv('RESTAURANT_NAME', 'Our Restaurant')
 
-# TTS (Text-to-Speech) — Deepgram Aura voice model
-# See https://developers.deepgram.com/api-reference/speak-api/
-DEEPGRAM_STT_MODEL = os.getenv('DEEPGRAM_STT_MODEL', 'nova-3-general')
-DEEPGRAM_TTS_MODEL = os.getenv('DEEPGRAM_TTS_MODEL', 'aura-asteria-en')
-DEEPGRAM_TTS_RATE = os.getenv('DEEPGRAM_TTS_RATE', '1.2')
+# Deepgram Voice Agent API — STT + LLM + TTS in one managed WebSocket.
+# See https://developers.deepgram.com/docs/voice-agent
+# STT: nova-3-general supports keyterm biasing (needed for Thai dish names);
+#      flux-general-en has better native turn-taking but NO keyterm support.
+DEEPGRAM_VOICE_AGENT_STT_MODEL = os.getenv('DEEPGRAM_VOICE_AGENT_STT_MODEL', 'nova-3-general')
+DEEPGRAM_VOICE_AGENT_LLM_MODEL = os.getenv('DEEPGRAM_VOICE_AGENT_LLM_MODEL', 'gpt-4o-mini')
+DEEPGRAM_VOICE_AGENT_TTS_MODEL = os.getenv('DEEPGRAM_VOICE_AGENT_TTS_MODEL', 'aura-asteria-en')
+DEEPGRAM_VOICE_AGENT_TEMPERATURE = float(os.getenv('DEEPGRAM_VOICE_AGENT_TEMPERATURE', '0'))

@@ -1,42 +1,62 @@
 """
-Conversation agent using OpenAI for restaurant order taking.
+Deepgram Voice Agent configuration + order persistence.
+
+The Deepgram Voice Agent API replaces the old DIY pipeline (Deepgram STT +
+OpenAI + Deepgram Aura TTS) with a single managed WebSocket. This module
+builds the agent's Settings payload (system prompt, models, keyterms,
+functions, greeting) and saves orders that arrive via the `place_order`
+function call.
 """
-import json
+
 import logging
 import re
+from pathlib import Path
+
 from django.conf import settings
-from openai import AsyncOpenAI
+
+from deepgram.agent.v1 import (
+    AgentV1Settings,
+    AgentV1SettingsAgent,
+    AgentV1SettingsAgentListen,
+    AgentV1SettingsAgentListenProvider_V1,
+    AgentV1SettingsAudio,
+    AgentV1SettingsAudioInput,
+    AgentV1SettingsAudioOutput,
+)
+from deepgram.types.speak_settings_v1 import SpeakSettingsV1
+from deepgram.types.speak_settings_v1provider import SpeakSettingsV1Provider_Deepgram
+from deepgram.types.think_settings_v1 import ThinkSettingsV1, ThinkSettingsV1FunctionsItem
+from deepgram.types.think_settings_v1provider import ThinkSettingsV1Provider_OpenAi
 
 logger = logging.getLogger(__name__)
 
+# Live-edit override: if this file exists (repo root, gitignored), it is used
+# as the system prompt with the menu section replaced by live DB menu text.
+# Otherwise the embedded VA_SYSTEM_PROMPT template below is used.
+VA_PROMPT_FILE = Path(settings.BASE_DIR) / '_dg_va_prompt.txt'
 
-def strip_markdown(text: str) -> str:
-    """Remove common markdown artifacts that would be spoken by TTS."""
-    # Remove bold/italic markers
-    text = re.sub(r'\*{1,3}', '', text)
-    # Remove markdown link syntax [text](url)
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    # Remove backticks (inline and code blocks)
-    text = re.sub(r'`{1,3}', '', text)
-    # Remove heading markers
-    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
-    # Collapse multiple spaces into one
-    text = re.sub(r' +', ' ', text)
-    # Collapse multiple newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+GREETING = (
+    f"Thank you for calling {settings.RESTAURANT_NAME}. All our staff are "
+    "currently busy assisting other customers, but I can take your order "
+    "right away. What can I get for you today?"
+)
 
+# Appended to the system prompt regardless of source (file or embedded) —
+# teaches the model the place_order → end_conversation sequence.
+FUNCTION_CALL_INSTRUCTIONS = """
+## Placing the Order (FUNCTION CALLS)
+Orders are saved through function calls. Follow this exactly:
+1. Once the order is fully confirmed — every item read back with prices, customer name collected, callback phone number collected, total and 20-25 minute ETA given — call `place_order` FIRST, in your very next response, with the complete order details. Do NOT wait for more input from the customer, even if they just say "thanks".
+2. Output NO text before the call — no announcements like "I will place your order", no goodbyes, nothing. The FIRST thing in your response must be the `place_order` function call. The system saves the order and sends it to the restaurant; the customer does not need to know about this.
+3. After the call, say your natural goodbye ("Thank you, have a great day!").
+4. Then call `end_conversation`.
+5. Do not generate any text after calling `end_conversation`.
+"""
 
-def strip_order_json(text: str) -> str:
-    """Remove the order_complete JSON block from text before TTS speaks it."""
-    # Remove the order_complete JSON object — it's for the system, not the customer's ears
-    # Matches {"action":"order_complete",...} including nested braces
-    pattern = r'\n?\{\s*"action"\s*:\s*"order_complete".*?\}\s*$'
-    return re.sub(pattern, '', text, flags=re.DOTALL).strip()
-
-
-# System prompt template — menu is injected at call time
-SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You take food orders over the phone.
+# Embedded fallback system prompt — same content as the tested _dg_va_prompt.txt
+# working copy, but the menu section is a {menu_text} placeholder filled from
+# the DB at call time and the restaurant name is injected from settings.
+VA_SYSTEM_PROMPT = """You are an AI phone order taker for {restaurant_name}. You take food orders over the phone.
 
 ## Your Role
 - Be friendly, warm, and efficient — like a great server
@@ -77,7 +97,7 @@ Examples of correct pricing:
 - Do NOT tell customers that choosing chicken adds $3 — it only adds $3 if they ask for EXTRA chicken
 
 ## Order Flow
-1. Greet the customer: "Thank you for calling {restaurant_name}. All our staff are currently busy assisting other customers, but I can take your order right away. What can I get for you today?"
+1. The opening greeting is played automatically by the system before your first turn — go straight to taking the order. If the customer asks "who is this?" or "what can you do?", briefly explain you can take their food order for {restaurant_name}.
 2. Take their order item by item.
    - If the item has a "Spice level:" line, ALWAYS ask "how spicy would you like it, on a scale from 0 to 5?" (0 = no spice, 5 = spiciest). Use the NUMBER, don't list the words.
    - If it has a "Choice of:" line with proteins, ask which protein they'd like — it's included in the base price.
@@ -89,7 +109,7 @@ Examples of correct pricing:
 5. Ask for their name — just their name, nothing else
 6. After they give you their name, then ask for a callback phone number
 7. Give them a total and estimated time
-8. In your final message: say goodbye naturally, then output the JSON (see Finalization below) on its own line — this triggers the hang-up. Do NOT forget the JSON.
+8. Once the order is complete, your very next response must START with the `place_order` function call — no text before it (see "Ending the call" below). Do NOT wait for more input, even if the customer just says "thanks". Then say a natural goodbye, then call `end_conversation`.
 
 ## Rules
 - ONLY sell items on the menu — if someone asks for something not listed, politely say you don't have it and suggest the closest alternative
@@ -100,20 +120,16 @@ Examples of correct pricing:
 - If the customer wants to cancel or start over, do it cheerfully
 - Tell them the order will be ready in about 20 to 25 minutes
 
-## Finalization — CRITICAL — READ CAREFULLY
-In your FINAL goodbye message you MUST include the JSON below on its own line at the END. The system strips this JSON before TTS — the customer will NEVER hear it; only the system sees it to trigger hang-up and save the order.
-
-Output this EXACT JSON on its own line at the END of your final message:
-{{"action":"order_complete","order":{{"customer_name":"Customer Name","customer_phone":"555-123-4567","items":[{{"name":"Item Name","quantity":1,"price":9.99,"notes":"spice level 5, with chicken"}}],"notes":"","total":9.99}}}}
-
-Example final message — the JSON after the goodbye is silent, only spoken part is above it:
-"Thank you Peter, your Pad Thai with shrimp at spice level five comes to $17.59 total. It'll be ready in 20 to 25 minutes. Have a great day!
-{{"action":"order_complete","order":{{"customer_name":"Peter","customer_phone":"314-954-6598","items":[{{"name":"Pad Thai","quantity":1,"price":17.59,"notes":"spice level 5, shrimp"}}],"notes":"","total":17.59}}}}
-
-Without this JSON the call will NOT hang up, order will NOT save, SMS will NOT send.
-
+## Ending the call
+When the order is fully complete — every item confirmed and read back with prices, customer name collected, callback phone number collected, total and 20-25 minute ETA given — close the order in ONE final response:
+1. FIRST: call `place_order` with the complete order details. Output NO text before this call — no announcements, no goodbyes, nothing. The response must begin with the function call itself. The system saves the order and sends it to the restaurant.
+2. After the call, say a natural goodbye ("Thank you, have a great day!").
+3. Then call `end_conversation` to end the call.
+Do NOT call `end_conversation` until `place_order` has been called — unless there is no order to save (customer changed their mind, wrong number, cannot be heard, etc.).
+Never output raw JSON, markdown, or any machine-readable text in your replies — the customer can hear everything you say.
 ## Current Conversation
-Keep track of what's been ordered so far. The customer may add items, remove items, or modify items at any point."""
+Keep track of what's been ordered so far. The customer may add items, remove items, or modify items at any point.
+"""
 
 
 def get_menu_text():
@@ -167,167 +183,212 @@ def get_menu_text():
     return '\n\n'.join(sections)
 
 
-def build_system_prompt():
-    """Build the full system prompt with current menu."""
-    restaurant_name = getattr(settings, 'RESTAURANT_NAME', 'Our Restaurant')
-    menu_text = get_menu_text()
-    return SYSTEM_PROMPT.format(restaurant_name=restaurant_name, menu_text=menu_text)
+def load_keyterms():
+    """Read curated menu keyterms for STT biasing from _dg_keyterms.txt.
 
-
-def get_client():
-    """Get OpenAI async client."""
-    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-
-
-def build_keyterms(menu_items, max_chars: int = 800):
-    """Curated keyterm list for Deepgram STT biasing.
-
-    Deepgram's keyterm param biases decoding toward known vocabulary —
-    mispronounced dish names ("hot tire" → pad thai) get pulled to the closest
-    menu term. The server rejects oversized lists (verified empirically:
-    ~100 terms / ~800 chars connect fine, ~1400 chars gets HTTP 400), so we
-    curate to the most phonetically distinctive terms: multi-word names first
-    (most likely to be mispronounced, most informative), then multi-word
-    aliases, then single-word names, capped by total characters. Aliases also
-    appear in the prompt's "Pronunciations:" lines, so keyterm hits map cleanly.
-
-    Returns a deduped, lowercase list.
+    One keyterm per line (empty lines and #-prefixed lines skipped), deduped
+    and lowercased. Passed to the listen provider's `keyterms` field so
+    mispronounced Thai dish names ("cow soy" → Khao Soi) get biased toward
+    menu vocabulary. Returns [] if the file is missing.
     """
-    # Skip beverage categories — brand names are said directly (low garble
-    # risk) and they eat the character budget needed for dish names
-    SKIP_CATEGORIES = {'Beverages', 'NA Beverages'}
-
-    def is_food(item):
-        return (getattr(item, 'category', '') or '').strip() not in SKIP_CATEGORIES
-
+    path = Path(settings.BASE_DIR) / '_dg_keyterms.txt'
+    if not path.exists():
+        logger.warning('_dg_keyterms.txt not found — running without keyterm biasing')
+        return []
     seen = set()
     keyterms = []
-
-    def add(term):
-        # Strip container-size suffixes ("Dreamy Clouds 300 mL") — noise for STT
-        term = re.sub(r'\s+\d+\s*ml$', '', (term or '').strip().lower())
-        if term and term not in seen:
+    for line in path.read_text(encoding='utf-8').splitlines():
+        term = line.strip().lower()
+        if term and not term.startswith('#') and term not in seen:
             seen.add(term)
             keyterms.append(term)
-
-    # Each dish gets its name + aliases together — aliases are the
-    # mispronunciation vocabulary keyterm biasing exists for
-    for item in menu_items:
-        if not is_food(item):
-            continue
-        if len(item.name.split()) >= 2:
-            add(item.name)
-        for alias in getattr(item, 'aliases', []) or []:
-            if len(alias) >= 4:  # short aliases like 'ribs' are cheap and safe
-                add(alias)
-    # Single-word names last (cheap, low garble risk)
-    for item in menu_items:
-        if is_food(item) and len(item.name.split()) == 1:
-            add(item.name)
-
-    # Cap by total characters — cut the tail (list is ordered by value)
-    trimmed, budget = [], max_chars
-    for term in keyterms:
-        if budget - len(term) < 0:
-            break
-        trimmed.append(term)
-        budget -= len(term)
-    return trimmed
+    logger.info(f'Loaded {len(keyterms)} STT keyterms from {path.name}')
+    return keyterms
 
 
-class OrderAgent:
+def build_system_prompt():
+    """Build the system prompt: tested _dg_va_prompt.txt (with live menu) if
+    present, else the embedded template. FUNCTION_CALL_INSTRUCTIONS is
+    appended to either source."""
+    menu_text = get_menu_text()
+    restaurant_name = getattr(settings, 'RESTAURANT_NAME', 'Our Restaurant')
+
+    if VA_PROMPT_FILE.exists():
+        prompt = VA_PROMPT_FILE.read_text(encoding='utf-8')
+        # Replace the menu snapshot in the file with the live menu from the DB.
+        # The snapshot sits between "## The Menu" and "## Understanding ...".
+        replaced = re.sub(
+            r'(## The Menu\n).*?(\n## Understanding Protein Options & Pricing)',
+            lambda m: m.group(1) + menu_text + m.group(2),
+            prompt,
+            flags=re.DOTALL,
+        )
+        if replaced != prompt:
+            prompt = replaced
+        else:
+            # Markers not found (file edited) — use the file verbatim; it still
+            # contains a valid menu snapshot.
+            logger.warning('Menu markers not found in %s — using file verbatim', VA_PROMPT_FILE.name)
+    else:
+        prompt = VA_SYSTEM_PROMPT.format(
+            restaurant_name=restaurant_name, menu_text=menu_text
+        )
+
+    return prompt.strip() + '\n' + FUNCTION_CALL_INSTRUCTIONS.strip() + '\n'
+
+
+def build_functions():
+    """Function definitions sent to the Voice Agent in think settings.
+
+    `place_order` — client-side: the consumer receives a FunctionCallRequest,
+    saves the order + sends SMS, and returns the result.
+    `end_conversation` — Deepgram's built-in hangup signal; the consumer
+    schedules the Twilio REST hangup when it fires.
     """
-    Manages a single phone conversation. Tracks conversation state,
-    sends transcripts to OpenAI, and detects finalized orders.
+    place_order = ThinkSettingsV1FunctionsItem(
+        name='place_order',
+        description=(
+            "Save and send the customer's confirmed order to the restaurant. "
+            "Call FIRST, before any text, in the response immediately after "
+            "the order is complete: (1) every item confirmed with quantity, "
+            "spice level, protein choice, and paid add-ons; (2) the full order "
+            "read back with prices; (3) the customer's name; (4) a callback "
+            "phone number; (5) the total and the 20-25 minute ETA given. "
+            "Output no text before this call. After place_order, speak a "
+            "short goodbye, then call end_conversation."
+        ),
+        parameters={
+            'type': 'object',
+            'properties': {
+                'customer_name': {
+                    'type': 'string',
+                    'description': "Customer's name as they gave it (first name is sufficient).",
+                },
+                'customer_phone': {
+                    'type': 'string',
+                    'description': "Customer's callback phone number as spoken, e.g. '314-555-0123'.",
+                },
+                'items': {
+                    'type': 'array',
+                    'description': 'Every item in the confirmed order using exact menu names.',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'name': {
+                                'type': 'string',
+                                'description': 'Exact menu item name as listed on the menu.',
+                            },
+                            'quantity': {
+                                'type': 'integer',
+                                'description': 'Number of this item.',
+                                'minimum': 1,
+                            },
+                            'price': {
+                                'type': 'number',
+                                'description': 'Unit price in USD including paid add-ons (free choices do not change price).',
+                            },
+                            'notes': {
+                                'type': 'string',
+                                'description': "Customizations, e.g. 'spice level 5, with chicken, extra sauce'.",
+                            },
+                        },
+                        'required': ['name', 'quantity', 'price'],
+                    },
+                },
+                'total': {
+                    'type': 'number',
+                    'description': 'Grand total in USD for the entire order.',
+                },
+                'notes': {
+                    'type': 'string',
+                    'description': 'Order-level notes or special requests, or empty string.',
+                },
+            },
+            'required': ['customer_name', 'customer_phone', 'items', 'total'],
+        },
+    )
+
+    end_conversation = ThinkSettingsV1FunctionsItem(
+        name='end_conversation',
+        description=(
+            "End the phone call. Call after saying a natural goodbye — either "
+            "after place_order has saved the order, or when the call should end "
+            "without an order (customer changed their mind, wrong number, "
+            "cannot be heard, etc.). Do not generate text after calling it."
+        ),
+        parameters={
+            'type': 'object',
+            'properties': {
+                'reason': {
+                    'type': 'string',
+                    'description': 'Why the call is ending.',
+                    'enum': ['order_placed', 'no_order_needed', 'customer_goodbye', 'unable_to_help'],
+                }
+            },
+            'required': ['reason'],
+        },
+    )
+
+    return [place_order, end_conversation]
+
+
+def build_agent_settings():
+    """Build the Voice Agent Settings payload sent once per call.
+
+    Audio is Twilio-compatible mulaw 8kHz on both sides. STT uses nova-3
+    (the only model supporting keyterm biasing for Thai dish names), the LLM
+    is gpt-4o-mini at temperature 0 (deterministic order-taking), and TTS is
+    Deepgram Aura. The greeting is spoken by the agent automatically.
     """
-
-    def __init__(self):
-        self.client = get_client()
-        self.system_prompt = build_system_prompt()
-        self.messages = []  # Conversation history (alternating user/assistant)
-        self.order = None   # Will hold the extracted order dict when finalized
-        # Pre-fetch menu items (shared with STT keyterm biasing)
-        from .models import MenuItem
-        self.menu_items = list(MenuItem.objects.filter(available=True))
-
-    async def process_transcript(self, text: str) -> str:
-        """
-        Send the customer's spoken text to OpenAI and get a response.
-
-        Returns the assistant's response text.
-        If the response contains an order_complete action, self.order is set.
-        """
-        self.messages.append({'role': 'user', 'content': text})
-
-        # Build messages: system prompt + conversation history
-        api_messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages
-
-        try:
-            response = await self.client.chat.completions.create(
-                model='gpt-4o-mini',
-                max_tokens=300,
-                messages=api_messages,
-            )
-        except Exception as e:
-            logger.error(f'OpenAI API error: {e}')
-            return "I'm sorry, I didn't quite catch that. Could you repeat it?"
-
-        reply = response.choices[0].message.content.strip()
-        reply = strip_markdown(reply)
-        self.messages.append({'role': 'assistant', 'content': reply})
-
-        # Trim conversation history to prevent unbounded growth and increasing latency.
-        # Keep last 20 messages (10 turns). Older context is rarely needed for order-taking.
-        if len(self.messages) > 20:
-            self.messages = self.messages[-20:]
-
-        # Check if the model signaled order completion
-        self._try_extract_order(reply)
-
-        return reply
-
-    def _try_extract_order(self, text: str):
-        """Look for the order_complete JSON in the response."""
-        try:
-            # Find JSON block in the response
-            start = text.find('{"action":"order_complete"')
-            if start == -1:
-                return
-
-            # Find matching closing brace
-            brace_count = 0
-            end = start
-            for i in range(start, len(text)):
-                if text[i] == '{':
-                    brace_count += 1
-                elif text[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end = i + 1
-                        break
-
-            json_str = text[start:end]
-            data = json.loads(json_str)
-
-            if data.get('action') == 'order_complete':
-                self.order = data.get('order', {})
-                logger.info(f'Order extracted: {json.dumps(self.order, indent=2)}')
-
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f'Failed to parse order JSON: {e}')
-
-    @property
-    def is_order_complete(self):
-        return self.order is not None
+    return AgentV1Settings(
+        type='Settings',
+        audio=AgentV1SettingsAudio(
+            input=AgentV1SettingsAudioInput(encoding='mulaw', sample_rate=8000),
+            output=AgentV1SettingsAudioOutput(
+                encoding='mulaw', sample_rate=8000, container='none',
+            ),
+        ),
+        agent=AgentV1SettingsAgent(
+            listen=AgentV1SettingsAgentListen(
+                # v1 provider for Nova models (v2 is Flux-only — Deepgram
+                # rejects nova models on v2 with "Invalid tier 'nova'").
+                provider=AgentV1SettingsAgentListenProvider_V1(
+                    version='v1',
+                    type='deepgram',
+                    model=settings.DEEPGRAM_VOICE_AGENT_STT_MODEL,
+                    keyterms=load_keyterms(),
+                ),
+            ),
+            think=ThinkSettingsV1(
+                provider=ThinkSettingsV1Provider_OpenAi(
+                    type='open_ai',
+                    model=settings.DEEPGRAM_VOICE_AGENT_LLM_MODEL,
+                    temperature=settings.DEEPGRAM_VOICE_AGENT_TEMPERATURE,
+                ),
+                prompt=build_system_prompt(),
+                functions=build_functions(),
+            ),
+            speak=SpeakSettingsV1(
+                provider=SpeakSettingsV1Provider_Deepgram(
+                    type='deepgram',
+                    model=settings.DEEPGRAM_VOICE_AGENT_TTS_MODEL,
+                ),
+            ),
+            greeting=GREETING,
+        ),
+    )
 
 
-def save_order_from_agent(agent: OrderAgent, call_sid: str = ''):
+def save_order_from_agent(order_data: dict, call_sid: str = ''):
     """
-    Save the extracted order from the agent to the database and send SMS.
+    Save an extracted order to the database.
+
+    `order_data` is the arguments dict from the `place_order` function call:
+        {customer_name, customer_phone, items: [{name, quantity, price, notes}],
+         total, notes}
     """
     from .models import Order, OrderItem, MenuItem
 
-    order_data = agent.order
     if not order_data:
         return None
 
