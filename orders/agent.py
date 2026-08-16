@@ -49,8 +49,9 @@ Orders are saved through function calls. Follow this exactly:
 1. Once the order is fully confirmed — every item read back with prices, customer name collected, callback phone number collected, total and 20-25 minute ETA given — call `place_order` FIRST, in your very next response, with the complete order details. Do NOT wait for more input from the customer, even if they just say "thanks".
 2. Output NO text before the call — no announcements like "I will place your order", no goodbyes, nothing. The FIRST thing in your response must be the `place_order` function call. The system saves the order and sends it to the restaurant; the customer does not need to know about this.
 3. After the call, say your natural goodbye ("Thank you, have a great day!").
-4. Then call `end_conversation`.
+4. Then call `end_conversation` with reason `order_placed`.
 5. Do not generate any text after calling `end_conversation`.
+6. CRITICAL: step 4 is mandatory and must happen in this same response, right after the goodbye. Never end a call without `end_conversation`, and never wait for the customer to speak again — otherwise the caller is left on the line in silence.
 """
 
 # Embedded fallback system prompt — same content as the tested _dg_va_prompt.txt
@@ -131,6 +132,7 @@ When the order is fully complete — every item confirmed and read back with pri
 1. FIRST: call `place_order` with the complete order details. Output NO text before this call — no announcements, no goodbyes, nothing. The response must begin with the function call itself. The system saves the order and sends it to the restaurant.
 2. After the call, say a natural goodbye ("Thank you, have a great day!").
 3. Then call `end_conversation` to end the call.
+CRITICAL: Step 3 is mandatory — you MUST call `end_conversation` (reason: `order_placed`) in this same final response, immediately after the goodbye. Never end a call without it, and never wait for the customer to speak again — otherwise the caller is left on the line in silence.
 Do NOT call `end_conversation` until `place_order` has been called — unless there is no order to save (customer changed their mind, wrong number, cannot be heard, etc.).
 Never output raw JSON, markdown, or any machine-readable text in your replies — the customer can hear everything you say.
 ## Current Conversation

@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 SETTINGS_TIMEOUT = 5.0   # Seconds to wait for SettingsApplied before giving up
 HANGUP_DELAY = 3.0       # Seconds to let the agent's final audio finish before hangup
+ORDER_PLACED_HANGUP_DELAY = 16.0  # Server-side fallback: hang up this long after place_order
 
 
 class CallConsumer(AsyncWebsocketConsumer):
@@ -257,6 +258,14 @@ class CallConsumer(AsyncWebsocketConsumer):
             )
         )
 
+        # place_order: the order is saved, so the conversation is over. The LLM
+        # is instructed to say a goodbye and then call end_conversation, but it
+        # doesn't reliably do so — arm the hangup here as a server-side fallback
+        # so the call always ends shortly after the order is placed.
+        if name == 'place_order' and result.get('status') == 'saved' and not self._hangup_scheduled:
+            self._hangup_scheduled = True
+            asyncio.create_task(self._hangup_after_delay(delay=ORDER_PLACED_HANGUP_DELAY))
+
         # end_conversation: the goodbye is already spoken — give any trailing
         # audio time to finish, then hang up. A closed agent socket (server-side
         # end_conversation) hits the same path via the listen-loop backstop.
@@ -288,9 +297,9 @@ class CallConsumer(AsyncWebsocketConsumer):
     # Hangup + cleanup
     # ------------------------------------------------------------------
 
-    async def _hangup_after_delay(self):
+    async def _hangup_after_delay(self, delay: float = HANGUP_DELAY):
         """Hang up after the agent's final audio has played."""
-        await asyncio.sleep(HANGUP_DELAY)
+        await asyncio.sleep(delay)
         await self._hangup_now()
 
     async def _hangup_now(self):
