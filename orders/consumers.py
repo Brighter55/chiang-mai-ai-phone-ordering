@@ -27,6 +27,7 @@ from django.conf import settings
 from deepgram import AsyncDeepgramClient
 from deepgram.agent.v1 import (
     AgentV1AgentAudioDone,
+    AgentV1AgentStartedSpeaking,
     AgentV1ConversationText,
     AgentV1Error,
     AgentV1FunctionCallRequest,
@@ -45,7 +46,9 @@ logger = logging.getLogger(__name__)
 
 SETTINGS_TIMEOUT = 5.0   # Seconds to wait for SettingsApplied before giving up
 HANGUP_DELAY = 3.0       # Seconds to let the agent's final audio finish before hangup
-ORDER_PLACED_HANGUP_DELAY = 16.0  # Server-side fallback: hang up this long after place_order
+ORDER_PLACED_HANGUP_DELAY = 16.0  # Safety net: hang up this long after place_order no matter what
+POST_ORDER_QUIET_DELAY = 3.0      # Primary end after place_order: hang up this long after the
+                                  # agent's audio goes quiet (model rarely calls end_conversation)
 
 
 class CallConsumer(AsyncWebsocketConsumer):
@@ -69,6 +72,8 @@ class CallConsumer(AsyncWebsocketConsumer):
         self._settings_applied = asyncio.Event()
         self._hangup_scheduled = False
         self._cleaned_up = False
+        self._after_place_order = False
+        self._quiet_hangup_task = None  # Pending post-order quiet hangup (re-armed per utterance)
         self._media_forwarded = 0    # Audio packet counter for liveness logging
         self._pre_stream_buffer = []  # Agent audio before Twilio 'start' (flushed once stream_sid known)
 
@@ -203,6 +208,16 @@ class CallConsumer(AsyncWebsocketConsumer):
 
         elif isinstance(message, AgentV1AgentAudioDone):
             logger.debug('Agent audio finished')
+            # After a successful place_order the call should end shortly after
+            # the agent's closing speech. Each finished utterance re-arms a
+            # short quiet timer; when the agent goes quiet (goodbye done), hang up.
+            if self._after_place_order:
+                self._arm_quiet_hangup()
+
+        elif isinstance(message, AgentV1AgentStartedSpeaking):
+            # New agent speech is starting — cancel any pending quiet hangup so
+            # it doesn't fire mid-sentence. The next AgentAudioDone re-arms it.
+            self._cancel_quiet_hangup()
 
         elif isinstance(message, AgentV1Error):
             logger.error(f'Agent error: {message.description} ({message.code})')
@@ -258,17 +273,21 @@ class CallConsumer(AsyncWebsocketConsumer):
             )
         )
 
-        # place_order: the order is saved, so the conversation is over. The LLM
-        # is instructed to say a goodbye and then call end_conversation, but it
-        # doesn't reliably do so — arm the hangup here as a server-side fallback
-        # so the call always ends shortly after the order is placed.
+        # place_order: the order is saved, so the conversation is over. The model
+        # is unreliable at calling end_conversation after the goodbye, so once the
+        # order is placed the call is ended server-side: the primary path hangs up
+        # shortly after the agent's closing audio goes quiet (AgentAudioDone →
+        # POST_ORDER_QUIET_DELAY), and the max fallback timer below is the safety net.
         if name == 'place_order' and result.get('status') == 'saved' and not self._hangup_scheduled:
             self._hangup_scheduled = True
             asyncio.create_task(self._hangup_after_delay(delay=ORDER_PLACED_HANGUP_DELAY))
+            self._after_place_order = True
 
         # end_conversation: the goodbye is already spoken — give any trailing
         # audio time to finish, then hang up. A closed agent socket (server-side
         # end_conversation) hits the same path via the listen-loop backstop.
+        # Only meaningful when no hangup is scheduled yet (e.g. the call ends
+        # without an order) — after place_order the quiet timer governs instead.
         if name == 'end_conversation' and not self._hangup_scheduled:
             self._hangup_scheduled = True
             asyncio.create_task(self._hangup_after_delay())
@@ -296,6 +315,28 @@ class CallConsumer(AsyncWebsocketConsumer):
     # ------------------------------------------------------------------
     # Hangup + cleanup
     # ------------------------------------------------------------------
+
+    def _cancel_quiet_hangup(self):
+        """Cancel a pending post-order quiet hangup (agent started speaking again)."""
+        if self._quiet_hangup_task is not None:
+            self._quiet_hangup_task.cancel()
+            self._quiet_hangup_task = None
+
+    def _arm_quiet_hangup(self):
+        """Reset the post-order quiet timer — end the call POST_ORDER_QUIET_DELAY
+        after the agent's last utterance following place_order."""
+        self._cancel_quiet_hangup()
+        self._quiet_hangup_task = asyncio.create_task(
+            self._quiet_hangup_after(delay=POST_ORDER_QUIET_DELAY)
+        )
+
+    async def _quiet_hangup_after(self, delay: float):
+        await asyncio.sleep(delay)
+        if self._cleaned_up:
+            return
+        self._quiet_hangup_task = None  # this task just ran its timer — nothing to cancel
+        logger.info('Post-order quiet period elapsed — ending call')
+        await self._hangup_now()
 
     async def _hangup_after_delay(self, delay: float = HANGUP_DELAY):
         """Hang up after the agent's final audio has played."""
@@ -327,6 +368,7 @@ class CallConsumer(AsyncWebsocketConsumer):
         if self._cleaned_up:
             return
         self._cleaned_up = True
+        self._cancel_quiet_hangup()
 
         if self.listen_task:
             self.listen_task.cancel()
