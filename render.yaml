@@ -27,3 +27,11 @@ services:
         sync: false
       - key: RESTAURANT_NAME
         sync: false
+      - key: CLOVER_MERCHANT_ID
+        sync: false
+      - key: CLOVER_API_TOKEN
+        sync: false
+      - key: CLOVER_BASE_URL
+        sync: false
+      - key: CLOVER_ORDER_TYPE_NAME
+        sync: false

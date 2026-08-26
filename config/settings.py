@@ -134,3 +134,13 @@ DEEPGRAM_VOICE_AGENT_STT_MODEL = os.getenv('DEEPGRAM_VOICE_AGENT_STT_MODEL', 'no
 DEEPGRAM_VOICE_AGENT_LLM_MODEL = os.getenv('DEEPGRAM_VOICE_AGENT_LLM_MODEL', 'gpt-4o-mini')
 DEEPGRAM_VOICE_AGENT_TTS_MODEL = os.getenv('DEEPGRAM_VOICE_AGENT_TTS_MODEL', 'aura-asteria-en')
 DEEPGRAM_VOICE_AGENT_TEMPERATURE = float(os.getenv('DEEPGRAM_VOICE_AGENT_TEMPERATURE', '0'))
+
+# Clover POS — menu source of truth + order placement.
+# Token: long-lived merchant API token (API Access → Generate Token), not OAuth.
+CLOVER_MERCHANT_ID = os.getenv('CLOVER_MERCHANT_ID')
+CLOVER_API_TOKEN = os.getenv('CLOVER_API_TOKEN')
+CLOVER_BASE_URL = os.getenv('CLOVER_BASE_URL', 'https://api.clover.com')
+CLOVER_ORDER_TYPE_NAME = os.getenv('CLOVER_ORDER_TYPE_NAME', 'Take out')
+# Optional hardcoded order-type id — bypasses the /order_types lookup, which some
+# API tokens can't read (401). Find the id in the dashboard URL for that order type.
+CLOVER_ORDER_TYPE_ID = os.getenv('CLOVER_ORDER_TYPE_ID', '')

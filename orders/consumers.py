@@ -40,6 +40,7 @@ from deepgram.agent.v1.socket_client import V1SocketClientResponse
 from deepgram.core.pydantic_utilities import parse_obj_as
 
 from .agent import build_agent_settings, save_order_from_agent
+from .clover import send_order_to_clover
 from .notify import get_twilio_client, send_order_sms
 
 logger = logging.getLogger(__name__)
@@ -293,18 +294,23 @@ class CallConsumer(AsyncWebsocketConsumer):
             asyncio.create_task(self._hangup_after_delay())
 
     async def _place_order(self, args: dict) -> dict:
-        """Save the order to the DB and send the SMS notification."""
-        def _save_and_sms():
+        """Save the order locally, send the SMS backup, and push to Clover."""
+        def _save_sms_and_clover():
             order = save_order_from_agent(args, call_sid=self.call_sid)
-            if order:
-                sms_sid = send_order_sms(order)
-                return order, sms_sid
-            return None, None
+            if not order:
+                return None, None, None
+            sms_sid = send_order_sms(order)          # Twilio SMS backup — unchanged
+            clover_id = send_order_to_clover(order)  # Clover push — best-effort, never blocks
+            return order, sms_sid, clover_id
 
         try:
-            order, sms_sid = await sync_to_async(_save_and_sms, thread_sensitive=False)()
+            order, sms_sid, clover_id = await sync_to_async(
+                _save_sms_and_clover, thread_sensitive=False
+            )()
             if order:
-                logger.info(f'Order #{order.id} saved and SMS sent: {sms_sid}')
+                logger.info(
+                    f'Order #{order.id} saved; SMS={sms_sid}; Clover={clover_id or "failed/not configured"}'
+                )
                 return {'status': 'saved', 'order_id': order.id, 'total': str(order.total)}
             logger.error('Failed to save order from function args')
             return {'status': 'error', 'message': 'Order could not be saved'}
