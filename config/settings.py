@@ -124,6 +124,10 @@ TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 RESTAURANT_PHONE = os.getenv('RESTAURANT_PHONE')
+# Optional: phone number to transfer callers to when they ask for a human.
+# MUST NOT equal RESTAURANT_PHONE (AT&T no-answer forwarding would bounce the
+# call back into the AI) or TWILIO_PHONE_NUMBER. Empty = feature disabled.
+TRANSFER_PHONE = os.getenv('TRANSFER_PHONE', '')
 RESTAURANT_NAME = os.getenv('RESTAURANT_NAME', 'Our Restaurant')
 
 # Deepgram Voice Agent API — STT + LLM + TTS in one managed WebSocket.

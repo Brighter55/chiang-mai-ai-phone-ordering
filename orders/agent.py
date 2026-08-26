@@ -28,6 +28,12 @@ from deepgram.types.speak_settings_v1provider import SpeakSettingsV1Provider_Dee
 from deepgram.types.think_settings_v1 import ThinkSettingsV1, ThinkSettingsV1FunctionsItem
 from deepgram.types.think_settings_v1provider import ThinkSettingsV1Provider_OpenAi
 
+from .transfer import (
+    TRANSFER_DECLINE_INSTRUCTIONS,
+    TRANSFER_INSTRUCTIONS,
+    transfer_enabled,
+)
+
 logger = logging.getLogger(__name__)
 
 # Live-edit override: if this file exists (repo root, gitignored), it is used
@@ -53,6 +59,7 @@ Orders are saved through function calls. Follow this exactly:
 5. Do not generate any text after calling `end_conversation`.
 6. CRITICAL: step 4 is mandatory and must happen in this same response, right after the goodbye. Never end a call without `end_conversation`, and never wait for the customer to speak again — otherwise the caller is left on the line in silence.
 7. Each item's `modifiers` field must contain ONLY customization names from that item's menu entry: the spice level as a plain number string ('0' to '5'), the protein/veggie choice verbatim (e.g. 'chicken', 'broccoli', 'Asian green veggies (gai lan)'), and any paid add-on exactly as listed (e.g. 'add chicken', 'add tofu (+$3.09)' → 'add tofu'). If the customer asks for something NOT listed on the item's menu entry (e.g. 'extra sauce on the side', 'no onions'), put it in that item's `notes` instead — never invent a modifier name.
+8. If the customer asks to speak to a human at any point, call `transfer_call` instead of following this sequence.
 """
 
 # Embedded fallback system prompt — same content as the tested _dg_va_prompt.txt
@@ -128,6 +135,9 @@ Examples of correct pricing:
 - If the customer wants to cancel or start over, do it cheerfully
 - Tell them the order will be ready in about 20 to 25 minutes
 
+## Transferring to a Human
+If the customer asks to speak to a human, a manager, the owner, or a staff member at any point, you will transfer them; the system plays the announcement. Make `transfer_call` your very next action with no text before it, and do not call `place_order` or `end_conversation`.
+
 ## Ending the call
 When the order is fully complete — every item confirmed and read back with prices, customer name collected, callback phone number collected, total and 20-25 minute ETA given — close the order in ONE final response:
 1. FIRST: call `place_order` with the complete order details. Output NO text before this call — no announcements, no goodbyes, nothing. The response must begin with the function call itself. The system saves the order and sends it to the restaurant.
@@ -135,6 +145,7 @@ When the order is fully complete — every item confirmed and read back with pri
 3. Then call `end_conversation` to end the call.
 CRITICAL: Step 3 is mandatory — you MUST call `end_conversation` (reason: `order_placed`) in this same final response, immediately after the goodbye. Never end a call without it, and never wait for the customer to speak again — otherwise the caller is left on the line in silence.
 Do NOT call `end_conversation` until `place_order` has been called — unless there is no order to save (customer changed their mind, wrong number, cannot be heard, etc.).
+If the customer asks to speak to a human at any point, call `transfer_call` instead of the steps above.
 Never output raw JSON, markdown, or any machine-readable text in your replies — the customer can hear everything you say.
 ## Current Conversation
 Keep track of what's been ordered so far. The customer may add items, remove items, or modify items at any point. If the customer adds or changes an item after a recap, just confirm the change — do not re-read the whole order unless they ask.
@@ -244,7 +255,8 @@ def load_keyterms():
 def build_system_prompt():
     """Build the system prompt: tested _dg_va_prompt.txt (with live menu) if
     present, else the embedded template. FUNCTION_CALL_INSTRUCTIONS is
-    appended to either source."""
+    appended to either source, then the transfer instructions (or the decline
+    text when transfers are disabled)."""
     menu_text = get_menu_text()
     restaurant_name = getattr(settings, 'RESTAURANT_NAME', 'Our Restaurant')
 
@@ -269,7 +281,12 @@ def build_system_prompt():
             restaurant_name=restaurant_name, menu_text=menu_text
         )
 
-    return prompt.strip() + '\n' + FUNCTION_CALL_INSTRUCTIONS.strip() + '\n'
+    base = prompt.strip() + '\n' + FUNCTION_CALL_INSTRUCTIONS.strip() + '\n'
+    if transfer_enabled():
+        base += TRANSFER_INSTRUCTIONS.strip() + '\n'
+    else:
+        base += TRANSFER_DECLINE_INSTRUCTIONS.strip() + '\n'
+    return base
 
 
 def build_functions():
@@ -279,6 +296,8 @@ def build_functions():
     saves the order + sends SMS, and returns the result.
     `end_conversation` — Deepgram's built-in hangup signal; the consumer
     schedules the Twilio REST hangup when it fires.
+    `transfer_call` (optional) — cold-transfers the caller to the staff line
+    configured in TRANSFER_PHONE; only exposed when transfers are enabled.
     """
     place_order = ThinkSettingsV1FunctionsItem(
         name='place_order',
@@ -377,7 +396,33 @@ def build_functions():
         },
     )
 
-    return [place_order, end_conversation]
+    functions = [place_order, end_conversation]
+
+    if transfer_enabled():
+        functions.append(ThinkSettingsV1FunctionsItem(
+            name='transfer_call',
+            description=(
+                "Transfer the customer to a human staff member. Call this if the "
+                "customer asks to speak to a human, a manager, the owner, or to be "
+                "transferred, at ANY point in the call (before, during, or after "
+                "placing an order). Call it immediately as your very next action, "
+                "with no text before it. Do NOT call place_order or end_conversation "
+                "when transferring. If the result is an error, apologize and continue "
+                "helping the customer."
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'reason': {
+                        'type': 'string',
+                        'description': "Optional short reason, e.g. 'customer asked for manager'.",
+                    },
+                },
+                'required': [],
+            },
+        ))
+
+    return functions
 
 
 def build_agent_settings():

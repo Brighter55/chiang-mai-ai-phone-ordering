@@ -25,6 +25,8 @@ services:
         sync: false
       - key: RESTAURANT_PHONE
         sync: false
+      - key: TRANSFER_PHONE
+        sync: false
       - key: RESTAURANT_NAME
         sync: false
       - key: CLOVER_MERCHANT_ID

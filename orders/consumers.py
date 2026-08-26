@@ -42,6 +42,7 @@ from deepgram.core.pydantic_utilities import parse_obj_as
 from .agent import build_agent_settings, save_order_from_agent
 from .clover import send_order_to_clover
 from .notify import get_twilio_client, send_order_sms
+from .transfer import build_transfer_twiml, transfer_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ class CallConsumer(AsyncWebsocketConsumer):
         self._cleaned_up = False
         self._after_place_order = False
         self._quiet_hangup_task = None  # Pending post-order quiet hangup (re-armed per utterance)
+        self._order_hangup_task = None  # 16s post-place_order safety timer (cancellable on transfer)
+        self._transferred = False       # Transfer succeeded: never REST-hangup, Twilio owns the call
+        self._transfer_result_url = ''  # Absolute <Dial action> URL from the voice webhook
         self._media_forwarded = 0    # Audio packet counter for liveness logging
         self._pre_stream_buffer = []  # Agent audio before Twilio 'start' (flushed once stream_sid known)
 
@@ -131,6 +135,7 @@ class CallConsumer(AsyncWebsocketConsumer):
             self.stream_sid = msg.get('streamSid', '')
             custom_params = start_data.get('customParameters', {})
             self.caller_phone = custom_params.get('caller_phone', '')
+            self._transfer_result_url = custom_params.get('transfer_result_url', '')
             logger.info(f'Stream started — call: {self.call_sid}, from: {self.caller_phone}')
             # Flush any agent audio that arrived before the stream started
             if self._pre_stream_buffer:
@@ -142,7 +147,13 @@ class CallConsumer(AsyncWebsocketConsumer):
         elif event == 'media':
             audio_bytes = base64.b64decode(msg['media']['payload'])
             if self.dg_socket and self._settings_applied.is_set():
-                await self.dg_socket.send_media(audio_bytes)
+                try:
+                    await self.dg_socket.send_media(audio_bytes)
+                except Exception as e:
+                    # Agent socket can close mid-transfer (Twilio 'stop' + our
+                    # teardown race the last audio) — stop forwarding, don't crash.
+                    logger.debug(f'Agent socket send failed: {e}')
+                    return
                 self._media_forwarded += 1
                 if self._media_forwarded % 250 == 1:  # Log every ~5s (50 packets/s)
                     logger.info(f'🎙 Audio streaming: {self._media_forwarded} packets forwarded')
@@ -258,6 +269,8 @@ class CallConsumer(AsyncWebsocketConsumer):
 
         if name == 'place_order':
             result = await self._place_order(args)
+        elif name == 'transfer_call':
+            result = await self._transfer_call(args)
         elif name == 'end_conversation':
             result = {'status': 'call_ended', 'reason': args.get('reason', '')}
         else:
@@ -265,14 +278,19 @@ class CallConsumer(AsyncWebsocketConsumer):
             result = {'status': 'error', 'message': f'Unknown function: {name}'}
 
         logger.info(f'Function call: {name} → {result}')
-        await self.dg_socket.send_function_call_response(
-            AgentV1SendFunctionCallResponse(
-                type='FunctionCallResponse',
-                name=name,
-                id=call_id,
-                content=json.dumps(result),
+        try:
+            await self.dg_socket.send_function_call_response(
+                AgentV1SendFunctionCallResponse(
+                    type='FunctionCallResponse',
+                    name=name,
+                    id=call_id,
+                    content=json.dumps(result),
+                )
             )
-        )
+        except Exception as e:
+            # A transfer tears the agent socket down right after the update —
+            # the response send can lose that race; the transfer already happened.
+            logger.debug(f'Function response send failed for {name}: {e}')
 
         # place_order: the order is saved, so the conversation is over. The model
         # is unreliable at calling end_conversation after the goodbye, so once the
@@ -281,8 +299,15 @@ class CallConsumer(AsyncWebsocketConsumer):
         # POST_ORDER_QUIET_DELAY), and the max fallback timer below is the safety net.
         if name == 'place_order' and result.get('status') == 'saved' and not self._hangup_scheduled:
             self._hangup_scheduled = True
-            asyncio.create_task(self._hangup_after_delay(delay=ORDER_PLACED_HANGUP_DELAY))
+            self._order_hangup_task = asyncio.create_task(
+                self._hangup_after_delay(delay=ORDER_PLACED_HANGUP_DELAY))
             self._after_place_order = True
+
+        # transfer_call: the call now belongs to Twilio's <Dial> — tear down our
+        # sockets as a separate task (never from inside the listen task: _cleanup
+        # awaits self.listen_task, which would be the current task).
+        if self._transferred:
+            asyncio.create_task(self._finish_after_transfer())
 
         # end_conversation: the goodbye is already spoken — give any trailing
         # audio time to finish, then hang up. A closed agent socket (server-side
@@ -318,6 +343,60 @@ class CallConsumer(AsyncWebsocketConsumer):
             logger.error(f'Order save error: {e}')
             return {'status': 'error', 'message': str(e)}
 
+    async def _transfer_call(self, args: dict) -> dict:
+        """Cold-transfer the call to a human via a REST TwiML update.
+
+        The update replaces the <Connect><Stream> TwiML with an announcement
+        <Say> + <Dial> to TRANSFER_PHONE. Twilio then stops the media stream
+        (we get a 'stop' event and the WS closes) and owns the call from here
+        on, so no server-side hangup path may run afterwards — that would kill
+        the bridged call. The destination comes from settings; the model never
+        supplies a phone number.
+        """
+        if self._transferred:
+            return {'status': 'transferring'}
+        if not transfer_enabled():
+            return {'status': 'error', 'message': 'Transfer is not available right now'}
+        if not self.call_sid:
+            return {'status': 'error', 'message': 'No active call to transfer'}
+
+        # Neutralize every server-side hangup path BEFORE touching the call:
+        self._hangup_scheduled = True     # listen-loop finally + end_conversation arming
+        self._cancel_order_hangup()       # 16s post-place_order safety timer
+        self._cancel_quiet_hangup()       # post-order quiet timer
+        self._transferred = True          # _hangup_now guard: skip REST status=completed
+
+        def _update():
+            client = get_twilio_client()
+            twiml = build_transfer_twiml(
+                settings.TRANSFER_PHONE, action_url=self._transfer_result_url)
+            client.calls(self.call_sid).update(twiml=str(twiml))
+            logger.info(f'📞 Transfer TwiML sent for call {self.call_sid}')
+
+        try:
+            await sync_to_async(_update, thread_sensitive=False)()
+        except Exception as e:
+            # Transfer failed — the call is still ours. Restore normal endings.
+            self._transferred = False
+            self._hangup_scheduled = False
+            if self._after_place_order:
+                self._arm_quiet_hangup()
+            logger.error(f'📞 Transfer failed for call {self.call_sid}: {e}')
+            return {'status': 'error',
+                    'message': 'Transfer failed — please continue helping the customer'}
+
+        logger.info(f'📞 Call {self.call_sid} transferred to human')
+        return {'status': 'transferring',
+                'message': 'The call is being transferred to a staff member'}
+
+    async def _finish_after_transfer(self):
+        """Tear down the Deepgram agent socket and the Twilio WebSocket after a
+        successful transfer, WITHOUT touching the call (Twilio now controls it
+        via the <Dial> TwiML). Runs as its own task so _cleanup's
+        `await self.listen_task` is legal."""
+        await self._cleanup()
+        await self.close()
+
     # ------------------------------------------------------------------
     # Hangup + cleanup
     # ------------------------------------------------------------------
@@ -327,6 +406,12 @@ class CallConsumer(AsyncWebsocketConsumer):
         if self._quiet_hangup_task is not None:
             self._quiet_hangup_task.cancel()
             self._quiet_hangup_task = None
+
+    def _cancel_order_hangup(self):
+        """Cancel the 16s post-place_order safety hangup (transfer path)."""
+        if self._order_hangup_task is not None:
+            self._order_hangup_task.cancel()
+            self._order_hangup_task = None
 
     def _arm_quiet_hangup(self):
         """Reset the post-order quiet timer — end the call POST_ORDER_QUIET_DELAY
@@ -350,22 +435,27 @@ class CallConsumer(AsyncWebsocketConsumer):
         await self._hangup_now()
 
     async def _hangup_now(self):
-        """Hang up the Twilio call via REST and close both sockets."""
+        """Hang up the Twilio call via REST and close both sockets.
+
+        After a successful transfer the TwiML update has already handed the
+        call to Twilio — a REST status='completed' would kill the bridged
+        call, so it is skipped (cleanup + close still run)."""
         if self._cleaned_up:
             return
         self._hangup_scheduled = True
 
-        def _hangup():
-            if not self.call_sid:
-                return
-            client = get_twilio_client()
-            try:
-                client.calls(self.call_sid).update(status='completed')
-                logger.info(f'Call {self.call_sid} hung up successfully')
-            except Exception as e:
-                logger.error(f'Failed to hang up call {self.call_sid}: {e}')
+        if not self._transferred:
+            def _hangup():
+                if not self.call_sid:
+                    return
+                client = get_twilio_client()
+                try:
+                    client.calls(self.call_sid).update(status='completed')
+                    logger.info(f'Call {self.call_sid} hung up successfully')
+                except Exception as e:
+                    logger.error(f'Failed to hang up call {self.call_sid}: {e}')
 
-        await sync_to_async(_hangup, thread_sensitive=False)()
+            await sync_to_async(_hangup, thread_sensitive=False)()
         await self._cleanup()
         await self.close()
 
@@ -375,6 +465,7 @@ class CallConsumer(AsyncWebsocketConsumer):
             return
         self._cleaned_up = True
         self._cancel_quiet_hangup()
+        self._cancel_order_hangup()
 
         if self.listen_task:
             self.listen_task.cancel()
