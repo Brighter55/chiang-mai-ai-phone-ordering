@@ -52,6 +52,7 @@ Orders are saved through function calls. Follow this exactly:
 4. Then call `end_conversation` with reason `order_placed`.
 5. Do not generate any text after calling `end_conversation`.
 6. CRITICAL: step 4 is mandatory and must happen in this same response, right after the goodbye. Never end a call without `end_conversation`, and never wait for the customer to speak again — otherwise the caller is left on the line in silence.
+7. Each item's `modifiers` field must contain ONLY customization names from that item's menu entry: the spice level as a plain number string ('0' to '5'), the protein/veggie choice verbatim (e.g. 'chicken', 'broccoli', 'Asian green veggies (gai lan)'), and any paid add-on exactly as listed (e.g. 'add chicken', 'add tofu (+$3.09)' → 'add tofu'). If the customer asks for something NOT listed on the item's menu entry (e.g. 'extra sauce on the side', 'no onions'), put it in that item's `notes` instead — never invent a modifier name.
 """
 
 # Embedded fallback system prompt — same content as the tested _dg_va_prompt.txt
@@ -325,6 +326,19 @@ def build_functions():
                                 'type': 'string',
                                 'description': "Customizations, e.g. 'spice level 5, with chicken, extra sauce'.",
                             },
+                            'modifiers': {
+                                'type': 'array',
+                                'items': {'type': 'string'},
+                                'description': (
+                                    "Customizations chosen from THIS item's menu entry, using the "
+                                    "exact option names as listed: the spice level as a plain "
+                                    "number ('0' to '5'), the protein/veggie choice verbatim "
+                                    "(e.g. 'chicken', 'broccoli'), or a paid add-on exactly as "
+                                    "listed (e.g. 'add chicken'). Do NOT include anything that "
+                                    "is not a listed option — put free-text or special requests "
+                                    "in 'notes' instead."
+                                ),
+                            },
                         },
                         'required': ['name', 'quantity', 'price'],
                     },
@@ -451,6 +465,7 @@ def save_order_from_agent(order_data: dict, call_sid: str = ''):
             quantity=item_data.get('quantity', 1),
             price=item_data.get('price', 0),
             notes=item_data.get('notes', ''),
+            modifiers=item_data.get('modifiers', []),
         )
 
     return order
