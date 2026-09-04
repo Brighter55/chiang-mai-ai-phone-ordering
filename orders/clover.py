@@ -335,6 +335,16 @@ def resolve_item_options(menu_item, chosen_options):
         norm = _norm(opt)
         target = None
 
+        # Negation phrases ("no X", "without X") say what the customer does NOT
+        # want. They must never auto-select a real modifier by containment —
+        # "no vegetables" must not select the "vegetables" modifier. They fall
+        # through to the line note unless an EXACT modifier matches above (e.g.
+        # Thai Iced Tea's literal "no iced" modifier).
+        # Detect on the raw option's first word: `_norm` strips spaces, which
+        # would turn "no vegetables" into "novegetables" and defeat the check.
+        first_word = re.split(r'[^a-z0-9]+', str(opt).lower(), maxsplit=1)[0]
+        is_negation = first_word in {'no', 'not', 'without', 'dont', 'don'}
+
         # 1. Bare integer 0..5 → spice modifier whose name starts with that digit.
         if norm.isdigit() and norm in '012345':
             for group in groups:
@@ -364,7 +374,8 @@ def resolve_item_options(menu_item, chosen_options):
                     break
 
         # 4. Token containment (one normalized string inside the other).
-        if not target:
+        #    Skipped for negation phrases — see `is_negation` above.
+        if not target and not is_negation:
             for group in groups:
                 target = _containment_in(group)
                 if target:
@@ -403,8 +414,11 @@ def build_atomic_order_payload(order, order_type_id=None):
     Build the orderCart payload for POST /atomic_order/orders from a local Order.
 
     Raises CloverError if a line item can't be linked to a Clover item.
-    Returns (payload, unresolved_notes) where unresolved_notes holds per-item
-    option strings that fell back to free text.
+    Special instructions — each item's `notes` plus any modifier string that
+    matched no real Clover modifier — are attached to that line item as its
+    `note` field (Clover's atomic-order lineItems accept a free-form note).
+    Returns (payload, unresolved_notes) where unresolved_notes holds the
+    per-item note text for logging.
     """
     from .models import OrderItem
 
@@ -423,19 +437,31 @@ def build_atomic_order_payload(order, order_type_id=None):
         paid_cents = sum(int(m.get('amount') or 0) for m in modifications)
         line_price_cents = max(dollars_to_cents(oi.price) - paid_cents, 0)
 
-        note = ''
-        if unresolved:
-            note = '; '.join(unresolved)
+        # Special instructions reach the ticket as the line-item `note` (Clover's
+        # atomic-order lineItems accept a free-form `note`). Two sources feed it:
+        # the LLM's item `notes` field (the contract for requests that aren't a
+        # listed option, e.g. "no vegetables") and any modifier strings that
+        # matched no real Clover modifier (defensive — the model sometimes emits
+        # such requests in `modifiers`). Dedupe, preserve order.
+        note_parts = []
+        for part in list(unresolved or []) + ([oi.notes] if oi.notes and oi.notes.strip() else []):
+            part = str(part).strip()
+            if part and part not in note_parts:
+                note_parts.append(part)
+        note = '; '.join(note_parts)
 
         # Clover's atomic order ignores `unitQty`/`quantity` for fixed-price
         # items — quantity is represented as one line item per unit. Expand.
         for _ in range(int(oi.quantity)):
-            line_items.append({
+            line_item = {
                 'item': {'id': menu_item.clover_item_id},
                 'name': oi.name,
                 'price': line_price_cents,
                 'modifications': modifications,
-            })
+            }
+            if note:
+                line_item['note'] = note
+            line_items.append(line_item)
         if note:
             unresolved_by_line.append(note)
 
