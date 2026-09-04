@@ -48,9 +48,11 @@ logger = logging.getLogger(__name__)
 
 SETTINGS_TIMEOUT = 5.0   # Seconds to wait for SettingsApplied before giving up
 HANGUP_DELAY = 3.0       # Seconds to let the agent's final audio finish before hangup
-ORDER_PLACED_HANGUP_DELAY = 16.0  # Safety net: hang up this long after place_order no matter what
-POST_ORDER_QUIET_DELAY = 3.0      # Primary end after place_order: hang up this long after the
-                                  # agent's audio goes quiet (model rarely calls end_conversation)
+POST_ORDER_QUIET_DELAY = 3.0  # End the call this long after the agent's last completed
+                              # utterance following place_order. Re-armed per utterance and
+                              # cancelled when speech starts, so it can never fire mid-speech.
+                              # No fixed post-place_order hard timer exists — one (16s) could
+                              # land while a long goodbye is still streaming.
 
 
 class CallConsumer(AsyncWebsocketConsumer):
@@ -76,7 +78,6 @@ class CallConsumer(AsyncWebsocketConsumer):
         self._cleaned_up = False
         self._after_place_order = False
         self._quiet_hangup_task = None  # Pending post-order quiet hangup (re-armed per utterance)
-        self._order_hangup_task = None  # 16s post-place_order safety timer (cancellable on transfer)
         self._transferred = False       # Transfer succeeded: never REST-hangup, Twilio owns the call
         self._transfer_result_url = ''  # Absolute <Dial action> URL from the voice webhook
         self._media_forwarded = 0    # Audio packet counter for liveness logging
@@ -292,15 +293,12 @@ class CallConsumer(AsyncWebsocketConsumer):
             # the response send can lose that race; the transfer already happened.
             logger.debug(f'Function response send failed for {name}: {e}')
 
-        # place_order: the order is saved, so the conversation is over. The model
-        # is unreliable at calling end_conversation after the goodbye, so once the
-        # order is placed the call is ended server-side: the primary path hangs up
-        # shortly after the agent's closing audio goes quiet (AgentAudioDone →
-        # POST_ORDER_QUIET_DELAY), and the max fallback timer below is the safety net.
-        if name == 'place_order' and result.get('status') == 'saved' and not self._hangup_scheduled:
-            self._hangup_scheduled = True
-            self._order_hangup_task = asyncio.create_task(
-                self._hangup_after_delay(delay=ORDER_PLACED_HANGUP_DELAY))
+        # place_order: the order is saved — the conversation is terminal. No
+        # timer is armed here (a fixed hard timer could land while the goodbye
+        # is still streaming); instead the AgentAudioDone handler above arms
+        # the post-order quiet timer once the closing speech completes, and an
+        # end_conversation call (below) arms HANGUP_DELAY as a second exit.
+        if name == 'place_order' and result.get('status') == 'saved':
             self._after_place_order = True
 
         # transfer_call: the call now belongs to Twilio's <Dial> — tear down our
@@ -312,8 +310,8 @@ class CallConsumer(AsyncWebsocketConsumer):
         # end_conversation: the goodbye is already spoken — give any trailing
         # audio time to finish, then hang up. A closed agent socket (server-side
         # end_conversation) hits the same path via the listen-loop backstop.
-        # Only meaningful when no hangup is scheduled yet (e.g. the call ends
-        # without an order) — after place_order the quiet timer governs instead.
+        # After place_order this still arms (place_order no longer pre-schedules
+        # a hangup), racing the quiet timer — whichever fires first wins.
         if name == 'end_conversation' and not self._hangup_scheduled:
             self._hangup_scheduled = True
             asyncio.create_task(self._hangup_after_delay())
@@ -362,7 +360,6 @@ class CallConsumer(AsyncWebsocketConsumer):
 
         # Neutralize every server-side hangup path BEFORE touching the call:
         self._hangup_scheduled = True     # listen-loop finally + end_conversation arming
-        self._cancel_order_hangup()       # 16s post-place_order safety timer
         self._cancel_quiet_hangup()       # post-order quiet timer
         self._transferred = True          # _hangup_now guard: skip REST status=completed
 
@@ -406,12 +403,6 @@ class CallConsumer(AsyncWebsocketConsumer):
         if self._quiet_hangup_task is not None:
             self._quiet_hangup_task.cancel()
             self._quiet_hangup_task = None
-
-    def _cancel_order_hangup(self):
-        """Cancel the 16s post-place_order safety hangup (transfer path)."""
-        if self._order_hangup_task is not None:
-            self._order_hangup_task.cancel()
-            self._order_hangup_task = None
 
     def _arm_quiet_hangup(self):
         """Reset the post-order quiet timer — end the call POST_ORDER_QUIET_DELAY
@@ -465,7 +456,6 @@ class CallConsumer(AsyncWebsocketConsumer):
             return
         self._cleaned_up = True
         self._cancel_quiet_hangup()
-        self._cancel_order_hangup()
 
         if self.listen_task:
             self.listen_task.cancel()
