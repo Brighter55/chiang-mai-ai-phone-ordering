@@ -4,6 +4,17 @@ An AI-powered phone ordering system for **Chiang Mai Thai Restaurant** in St. Lo
 
 Built with **Django + Django Channels + the Deepgram Voice Agent API** (managed speech-to-text, LLM, and text-to-speech in one WebSocket) **+ Twilio Voice/SMS + Clover POS**.
 
+## Impacts
+
+Before, every call that went unanswered was a sale lost to a busy kitchen. When staff couldn't pick up during the lunch rush, callers just hung up — and ordered elsewhere.
+
+With this system, a missed call no longer costs a sale:
+
+- **📈 Lost sales eliminated** — if no one in the restaurant picks up, the AI answers, takes the full order, and pushes it to the kitchen. The order that used to walk away now goes through.
+- **⚖️ AI used only when people can't answer** — the restaurant phone always rings first; the assistant steps in *only* when no human is available and callers still reach a real person whenever staff can pick up, thus keeping the staff-to-customer interaction while eliminating the lost sales. 
+- **🙂 Better customer experience** — customers are never left with an unanswered ring or dumped into voicemail. Instead of giving up and calling somewhere else, they get a friendly voice that takes their order and confirms it back — which keeps them coming back.
+
+
 ## How It Works
 
 1. **Customer calls** the restaurant's Twilio number
